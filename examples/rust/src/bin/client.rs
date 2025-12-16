@@ -745,6 +745,7 @@ async fn geyser_subscribe(
                         Some(UpdateOneof::Block(_)) => (&mut pb_blocks_c, &pb_blocks),
                         Some(UpdateOneof::Ping(_)) => (&mut pb_pp_c, &pb_pp),
                         Some(UpdateOneof::Pong(_)) => (&mut pb_pp_c, &pb_pp),
+                        Some(UpdateOneof::Accounts(_)) => (&mut pb_accounts_c, &pb_accounts),
                         None => {
                             pb_multi.println("update not found in the message")?;
                             break;
@@ -920,6 +921,11 @@ async fn geyser_subscribe(
                             .await?;
                     }
                     Some(UpdateOneof::Pong(_)) => {}
+                    Some(UpdateOneof::Accounts(batch)) => {
+                        print_update("Got snapshot batch", created_at, &filters, json!({
+                            "accountsLength": batch.accounts.len(),
+                        }));
+                    }
                     None => {
                         error!("update not found in the message");
                         break;

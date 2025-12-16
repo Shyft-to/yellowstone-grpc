@@ -594,6 +594,7 @@ impl Message {
             UpdateOneof::Entry(msg) => {
                 Self::Entry(Arc::new(MessageEntry::from_update_oneof(&msg, created_at)?))
             }
+            UpdateOneof::Accounts(_) => return Err("Snapshot batch message is not supported"),
         })
     }
 }

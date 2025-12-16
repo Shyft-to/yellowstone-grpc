@@ -1186,6 +1186,9 @@ impl GrpcService {
             }
         }
 
+        const BATCH_SIZE: usize = 5_000;
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+
         loop {
             if cancellation_token.is_cancelled() {
                 info!("client #{id}: cancelled");
@@ -1194,7 +1197,10 @@ impl GrpcService {
             let message = match snapshot_rx.try_recv() {
                 Ok(message) => {
                     metrics::message_queue_size_dec();
-                    message
+                    match *message {
+                        Message::Account(a) => a,
+                        _ => continue
+                    }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     sleep(Duration::from_millis(1)).await;
@@ -1206,11 +1212,20 @@ impl GrpcService {
                 }
             };
 
-            for message in filter.get_updates(&message, None) {
-                if stream_tx.send(Ok(message)).await.is_err() {
-                    error!("client #{id}: stream closed");
-                    return Err(ClientSnapshotReplayError::ClientGrpcConnectionClosed);
-                }
+            batch.push(message);
+
+            if batch.len() < BATCH_SIZE {
+                continue;
+            }
+
+            let old_batch = batch;
+            batch = Vec::with_capacity(BATCH_SIZE);
+
+            let update = FilteredUpdate::new_empty(FilteredUpdateOneof::snapshot_accounts(old_batch));
+
+            if stream_tx.send(Ok(update)).await.is_err() {
+                error!("client #{id}: stream closed");
+                return Err(ClientSnapshotReplayError::ClientGrpcConnectionClosed);
             }
         }
 

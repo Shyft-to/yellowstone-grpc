@@ -5,7 +5,7 @@ use {
             SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
             SubscribeUpdateEntry, SubscribeUpdatePing, SubscribeUpdatePong, SubscribeUpdateSlot,
             SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
-            SubscribeUpdateTransactionStatus,
+            SubscribeUpdateTransactionStatus, SubscribeUpdateSnapshot,
         },
         plugin::{
             filter::{name::FilterName, FilterAccountsDataSlice},
@@ -232,6 +232,7 @@ impl FilteredUpdate {
             FilteredUpdateOneof::Entry(msg) => {
                 UpdateOneof::Entry(Self::as_subscribe_update_entry(&msg.0))
             }
+            FilteredUpdateOneof::SnapshotAccounts(accounts) => UpdateOneof::Accounts(accounts.clone()),
         };
 
         SubscribeUpdate {
@@ -307,6 +308,9 @@ impl FilteredUpdate {
                 let entry = MessageEntry::from_update_oneof(&msg, created_at)?;
                 FilteredUpdateOneof::Entry(FilteredUpdateEntry(Arc::new(entry)))
             }
+            UpdateOneof::Accounts(msg) => {
+                FilteredUpdateOneof::SnapshotAccounts(msg)
+            }
         };
 
         Ok(Self {
@@ -330,6 +334,7 @@ pub enum FilteredUpdateOneof {
     Pong(SubscribeUpdatePong),                          // 9
     BlockMeta(Arc<MessageBlockMeta>),                   // 7
     Entry(FilteredUpdateEntry),                         // 8
+    SnapshotAccounts(SubscribeUpdateSnapshot),          // 12
 }
 
 impl FilteredUpdateOneof {
@@ -379,6 +384,16 @@ impl FilteredUpdateOneof {
     pub const fn entry(message: Arc<MessageEntry>) -> Self {
         Self::Entry(FilteredUpdateEntry(message))
     }
+
+    pub fn snapshot_accounts(messages: Vec<MessageAccount>) -> Self {
+        Self::SnapshotAccounts(SubscribeUpdateSnapshot { accounts: messages.iter().map(|message| {
+            SubscribeUpdateAccount {
+                slot: message.slot,
+                account: Some(FilteredUpdate::as_subscribe_update_account(&message.account, &FilterAccountsDataSlice::default())),
+                is_startup: message.is_startup,
+            }
+        }).collect() })
+    }
 }
 
 impl prost::Message for FilteredUpdateOneof {
@@ -396,6 +411,7 @@ impl prost::Message for FilteredUpdateOneof {
             Self::Pong(msg) => message::encode(9u32, msg, buf),
             Self::BlockMeta(msg) => message::encode(7u32, &msg.block_meta, buf),
             Self::Entry(msg) => message::encode(8u32, msg, buf),
+            Self::SnapshotAccounts(msg) => message::encode(12u32, msg, buf),
         }
     }
 
@@ -410,6 +426,7 @@ impl prost::Message for FilteredUpdateOneof {
             Self::Pong(msg) => message::encoded_len(9u32, msg),
             Self::BlockMeta(msg) => message::encoded_len(7u32, &msg.block_meta),
             Self::Entry(msg) => message::encoded_len(8u32, msg),
+            Self::SnapshotAccounts(msg) => message::encoded_len(12u32, msg),
         }
     }
 

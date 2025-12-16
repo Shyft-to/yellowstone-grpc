@@ -19,7 +19,7 @@ use {
     std::{
         collections::{hash_map::Entry as HashMapEntry, HashMap},
         convert::Infallible,
-        sync::{Arc, Once},
+        sync::{Arc, Once}, time::Duration,
     },
     tokio::{
         net::TcpListener,
@@ -114,6 +114,13 @@ lazy_static::lazy_static! {
             "Histogram of all account update data (kib) received from Geyser plugin"
         )
         .buckets(vec![5.0, 10.0, 20.0, 30.0, 50.0, 100.0, 200.0, 300.0, 500.0, 1000.0, 2000.0, 3000.0, 5000.0, 10000.0])
+    ).unwrap();
+
+    static ref GEYSER_ACCOUNT_SEND_TIME: Histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "geyser_account_send_time_us",
+            "Histogram of snapshot account update sending time"
+        )
     ).unwrap();
 }
 
@@ -263,6 +270,7 @@ impl PrometheusService {
             register!(GRPC_MESSAGE_SENT);
             register!(GRPC_BYTES_SENT);
             register!(GEYSER_ACCOUNT_UPDATE_RECEIVED);
+            register!(GEYSER_ACCOUNT_SEND_TIME);
             register!(GRPC_SUBSCRIBER_SEND_BANDWIDTH_LOAD);
             register!(GRPC_SUBCRIBER_RX_LOAD);
             register!(GRPC_SUBSCRIBER_QUEUE_SIZE);
@@ -458,6 +466,10 @@ pub fn missed_status_message_inc(status: SlotStatus) {
 
 pub fn observe_geyser_account_update_received(data_bytesize: usize) {
     GEYSER_ACCOUNT_UPDATE_RECEIVED.observe(data_bytesize as f64 / 1024.0);
+}
+
+pub fn record_snapshot_send_time(t: Duration) {
+    GEYSER_ACCOUNT_SEND_TIME.observe(t.as_micros() as f64);
 }
 
 pub fn set_subscriber_send_bandwidth_load<S: AsRef<str>>(subscriber_id: S, load: i64) {

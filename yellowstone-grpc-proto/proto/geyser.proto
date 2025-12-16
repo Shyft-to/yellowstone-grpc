@@ -128,8 +128,13 @@ message SubscribeUpdate {
     SubscribeUpdatePong pong = 9;
     SubscribeUpdateBlockMeta block_meta = 7;
     SubscribeUpdateEntry entry = 8;
+    SubscribeUpdateSnapshot accounts = 12;
   }
   google.protobuf.Timestamp created_at = 11;
+}
+
+message SubscribeUpdateSnapshot {
+  repeated SubscribeUpdateAccount accounts = 1;
 }
 
 message SubscribeUpdateAccount {
