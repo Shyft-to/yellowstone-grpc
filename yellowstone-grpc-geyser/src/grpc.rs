@@ -1015,7 +1015,9 @@ impl GrpcService {
                             let send_started = Instant::now();
                             let _ =
                                 broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                            latency.record_producer_send(send_started.elapsed());
+                            let send_elapsed = send_started.elapsed();
+                            latency.record_producer_send(send_elapsed);
+                            latency.record_fanout_send(send_elapsed);
                             processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                             processed_sleep
                                 .as_mut()
@@ -1062,7 +1064,9 @@ impl GrpcService {
                                 let send_started = Instant::now();
                                 let _ = broadcast_tx
                                     .send((CommitmentLevel::Processed, encoded.into()));
-                                latency.record_producer_send(send_started.elapsed());
+                                let send_elapsed = send_started.elapsed();
+                                latency.record_producer_send(send_elapsed);
+                                latency.record_fanout_send(send_elapsed);
                                 processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                                 processed_sleep
                                     .as_mut()
@@ -1091,7 +1095,9 @@ impl GrpcService {
                         let encoded = parallel_encoder.encode(processed_messages).await;
                         let send_started = Instant::now();
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                        latency.record_producer_send(send_started.elapsed());
+                        let send_elapsed = send_started.elapsed();
+                        latency.record_producer_send(send_elapsed);
+                        latency.record_fanout_send(send_elapsed);
                         processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                     }
                     processed_sleep.as_mut().reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
