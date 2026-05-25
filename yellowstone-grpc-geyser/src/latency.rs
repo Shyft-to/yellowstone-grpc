@@ -169,6 +169,7 @@ pub struct LatencyMetrics {
     enabled: AtomicBool,
     end_to_end: AtomicHistogram,
     producer_send: AtomicHistogram,
+    fanout_send: AtomicHistogram,
     filter_encode: AtomicHistogram,
     client_queue_depth: AtomicHistogram,
 }
@@ -179,6 +180,7 @@ impl LatencyMetrics {
             enabled: AtomicBool::new(enabled),
             end_to_end: AtomicHistogram::new("end_to_end", "microseconds", TIME_BUCKETS_US),
             producer_send: AtomicHistogram::new("producer_send", "microseconds", TIME_BUCKETS_US),
+            fanout_send: AtomicHistogram::new("fanout_send", "microseconds", TIME_BUCKETS_US),
             filter_encode: AtomicHistogram::new("filter_encode", "microseconds", TIME_BUCKETS_US),
             client_queue_depth: AtomicHistogram::new("client_queue_depth", "items", DEPTH_BUCKETS),
         })
@@ -207,6 +209,18 @@ impl LatencyMetrics {
         self.producer_send.record(duration_us(elapsed));
     }
 
+    /// Record the duration of one fan-out send that wakes a subscriber set for
+    /// the processed commitment: the single broadcast send in the unoptimized
+    /// build, or one relay's per-shard send in the optimized build. Recorded in
+    /// both builds so the per-task fan-out wake cost is directly comparable.
+    #[inline]
+    pub fn record_fanout_send(&self, elapsed: Duration) {
+        if !self.enabled() {
+            return;
+        }
+        self.fanout_send.record(duration_us(elapsed));
+    }
+
     /// Record the per-message filter + encode duration on the subscriber path.
     #[inline]
     pub fn record_filter_encode(&self, elapsed: Duration) {
@@ -225,10 +239,11 @@ impl LatencyMetrics {
         self.client_queue_depth.record(depth);
     }
 
-    const fn histograms(&self) -> [&AtomicHistogram; 4] {
+    const fn histograms(&self) -> [&AtomicHistogram; 5] {
         [
             &self.end_to_end,
             &self.producer_send,
+            &self.fanout_send,
             &self.filter_encode,
             &self.client_queue_depth,
         ]

@@ -431,12 +431,18 @@ fn build_message_broadcast(
         let (shard_tx, _) = broadcast::channel::<FanoutPayload>(capacity);
         let relay_tx = shard_tx.clone();
         let mut source_rx = processed_source.subscribe();
+        let relay_latency = Arc::clone(&latency);
         task_tracker.spawn(async move {
             loop {
                 match source_rx.recv().await {
                     // Thin pass-through: cloning the payload is just an Arc bump.
+                    // Time the per-shard send: this is the relay's O(N/shards)
+                    // subscriber wake-up, the optimized counterpart of the
+                    // unoptimized producer's single O(N) fan-out send.
                     Ok(payload) => {
+                        let send_started = Instant::now();
                         let _ = relay_tx.send(payload);
+                        relay_latency.record_fanout_send(send_started.elapsed());
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         metrics::incr_relay_lagged(shard_id, skipped);
