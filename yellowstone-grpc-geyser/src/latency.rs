@@ -11,8 +11,10 @@
 //! short-circuits on a single relaxed bool load.
 //!
 //! Four measure points are captured (matching the four hot-path costs):
-//!   - `end_to_end`  (microseconds): geyser ingestion (`created_at`) -> just
-//!     before the update is handed to the client stream.
+//!   - `end_to_end`  (microseconds): geyser ingestion (`created_at`) -> when the
+//!     gRPC transport pulls the update off the client's outbound queue (the last
+//!     point inside the plugin). Spans fan-out, filter+encode, and the client's
+//!     outbound queue wait.
 //!   - `producer_send` (microseconds): time spent in a single broadcast send
 //!     on the `geyser_loop` critical path (the O(N) wake-all cost).
 //!   - `filter_encode` (microseconds): per-message `Filter::get_updates`

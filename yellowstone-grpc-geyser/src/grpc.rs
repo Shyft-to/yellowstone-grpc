@@ -353,6 +353,36 @@ impl SlotMessages {
 
 type BroadcastedMessage = (CommitmentLevel, Arc<Vec<(u64, Message)>>);
 
+/// Wraps a client's outbound stream so end-to-end latency is recorded at the
+/// moment the gRPC transport pulls each update off the client's outbound queue.
+///
+/// That is the last point the update is under the plugin's control, so the
+/// measured interval (`now - update.created_at`) spans the *whole* in-plugin
+/// path: geyser ingestion -> per-client filter + encode -> time spent waiting in
+/// the client's outbound queue. The earlier client-loop measure point excluded
+/// that final queue wait, which is the dominant cost when a subscriber can't
+/// keep up.
+pub struct EndToEndTimedStream {
+    inner: LoadAwareReceiver<TonicResult<FilteredUpdate>>,
+    latency: Arc<LatencyMetrics>,
+}
+
+impl futures::Stream for EndToEndTimedStream {
+    type Item = TonicResult<FilteredUpdate>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let polled = futures::Stream::poll_next(std::pin::Pin::new(&mut this.inner), cx);
+        if let std::task::Poll::Ready(Some(Ok(update))) = &polled {
+            this.latency.record_end_to_end(&update.created_at);
+        }
+        polled
+    }
+}
+
 enum ReplayedResponse {
     Messages(Vec<(u64, Message)>),
     Lagged(Slot),
@@ -1317,9 +1347,10 @@ impl GrpcService {
 
                     if commitment == session.filter.get_commitment_level() {
                         for (_msgid, message) in messages.iter() {
-                            if latency_enabled {
-                                latency.record_end_to_end(message.created_at());
-                            }
+                            // end_to_end is recorded later, when the gRPC transport
+                            // pulls the update off the client's outbound queue (see
+                            // EndToEndTimedStream), so it includes the outbound queue
+                            // wait. Here we only time the filter + encode step.
                             let fe_start = latency_enabled.then(Instant::now);
                             let updates = session.filter.get_updates(message, Some(commitment));
                             if let Some(started) = fe_start {
@@ -1538,7 +1569,7 @@ impl GrpcService {
 
 #[tonic::async_trait]
 impl Geyser for GrpcService {
-    type SubscribeStream = LoadAwareReceiver<TonicResult<FilteredUpdate>>;
+    type SubscribeStream = EndToEndTimedStream;
     type SubscribeDeshredStream =
         LoadAwareReceiver<TonicResult<yellowstone_grpc_proto::geyser::SubscribeUpdateDeshred>>;
 
@@ -1730,7 +1761,10 @@ impl Geyser for GrpcService {
             Arc::clone(&self.subscription_tracker),
         ));
 
-        Ok(Response::new(stream_rx))
+        Ok(Response::new(EndToEndTimedStream {
+            inner: stream_rx,
+            latency: Arc::clone(&self.latency),
+        }))
     }
 
     async fn subscribe_deshred(
