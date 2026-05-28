@@ -89,6 +89,12 @@ required-features = ["bench"]
 
 [features]
 bench = ["dep:prost_011", "dep:solana-storage-proto"]
+# Compiles the prometheus metric recording wrappers in `src/metrics.rs` and the
+# `GEYSER_BATCH_SIZE.observe(...)` call sites in `src/grpc.rs` to no-ops so the
+# fan-out hot path makes zero `with_label_values` calls. The /metrics endpoint
+# still serves (returns zero counters). For A/B-testing whether the shared
+# IntCounterVec/IntGaugeVec read-lock contention is the streaming-latency wall.
+no-metrics = []
 
 [build-dependencies]
 anyhow = { workspace = true }

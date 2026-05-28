@@ -4,7 +4,7 @@ use {
         metered::MeteredLayer,
         metrics::{
             self, incr_grpc_method_call_count, set_subscriber_queue_size,
-            subscription_limit_exceeded_inc, DebugClientMessage, GEYSER_BATCH_SIZE,
+            subscription_limit_exceeded_inc, DebugClientMessage,
         },
         parallel::ParallelEncoder,
         plugin::{
@@ -995,7 +995,8 @@ impl GrpcService {
 
                             // processed
                             processed_messages.push(message.clone());
-                            GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+                            #[cfg(not(feature = "no-metrics"))]
+                            metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                             let encoded = parallel_encoder.encode(processed_messages).await;
                             let _ =
                                 broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
@@ -1036,7 +1037,8 @@ impl GrpcService {
                                 || !confirmed_messages.is_empty()
                                 || !finalized_messages.is_empty()
                             {
-                                GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+                                #[cfg(not(feature = "no-metrics"))]
+                                metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                                 let encoded = parallel_encoder.encode(processed_messages).await;
                                 let _ = broadcast_tx
                                     .send((CommitmentLevel::Processed, encoded.into()));
@@ -1060,7 +1062,8 @@ impl GrpcService {
                 }
                 () = &mut processed_sleep => {
                     if !processed_messages.is_empty() {
-                        GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+                        #[cfg(not(feature = "no-metrics"))]
+                        metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                         let encoded = parallel_encoder.encode(processed_messages).await;
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
                         processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
