@@ -157,6 +157,68 @@ It's possible to add limits for filters in the config. If the `filters` field is
 }
 ```
 
+### Fan-out scaling & latency profiling
+
+Two `grpc` config options control fan-out parallelism and hot-path latency
+logging. Both have safe defaults, so they are optional.
+
+```json
+"grpc": {
+   "processed_fanout_shards": 4,
+   "latency_metrics_interval_seconds": 10
+}
+```
+
+| Param | Default | Values | Meaning |
+|---|---|---|---|
+| `processed_fanout_shards` | `4` | `>= 1` | Number of relay tasks the `processed` commitment is fanned out across. The producer wakes only the relays (O(shards)); each relay re-broadcasts to its slice of subscribers on its own task, so the per-message wake-all is parallelized off the single producer's critical path. Set toward the number of cores you can give streaming (e.g. the count in `tokio.affinity`). `1` keeps a single transparent relay. |
+| `latency_metrics_interval_seconds` | `10` | `>= 0` | Interval for emitting hot-path latency percentile logs. `0` disables latency instrumentation entirely (recording then short-circuits on a single atomic load). |
+
+#### Latency logs
+
+When `latency_metrics_interval_seconds > 0`, the plugin emits one JSON line per
+metric per interval to the `yellowstone_latency` log target. Each line is a
+self-contained JSON object (NDJSON):
+
+```json
+{"ts_ms":1716480000000,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":12345,"p50":120,"p90":480,"p99":2000,"max":15000,"mean":210.50}
+```
+
+Four metrics are recorded:
+
+| `metric` | `unit` | Meaning |
+|---|---|---|
+| `end_to_end` | microseconds | Geyser ingestion (`created_at`) → just before the update is handed to the client stream. |
+| `producer_send` | microseconds | Time spent in a single broadcast send on the producer's critical path (the fan-out wake cost). |
+| `filter_encode` | microseconds | Per-message `Filter::get_updates` (filter match + update build). |
+| `client_queue_depth` | items | Depth of a subscriber's outbound queue (per-client backpressure). |
+
+#### Capturing & inspecting the logs
+
+Extract the latency lines from the plugin log into an NDJSON file:
+
+```bash
+grep yellowstone_latency validator.log | sed 's/.*yellowstone_latency[^{]*//' > latency.ndjson
+```
+
+Watch a single metric live (requires `jq`):
+
+```bash
+tail -f validator.log \
+  | grep --line-buffered yellowstone_latency \
+  | sed -u 's/.*yellowstone_latency[^{]*//' \
+  | jq -c 'select(.metric=="producer_send") | {ts_ms, p50, p99, max}'
+```
+
+Summarise the p99 of each metric from a captured file:
+
+```bash
+jq -r '[.metric, .p99, .unit] | @tsv' latency.ndjson | sort | uniq -c
+```
+
+The JSON is plottable directly (x-axis = `ts_ms`, series = `p50`/`p90`/`p99`/`max`
+per `metric`) for an offline HTML/dashboard report.
+
 ### Unary gRPC methods
 
 #### Ping

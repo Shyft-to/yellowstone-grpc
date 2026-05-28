@@ -1,0 +1,1426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Yellowstone latency — run comparison</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2129;
+    --panel2: #222c36;
+    --border: #2e3b47;
+    --fg: #d6e2ee;
+    --muted: #8aa0b3;
+    --accent: #4fc3f7;
+    --grid: #2a3640;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 18px 24px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; }
+  .wrap { padding: 18px 24px 48px; }
+
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    align-items: flex-start;
+    margin-bottom: 18px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .card h3 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+
+  label.fld { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  input[type=text], textarea, select {
+    width: 100%;
+    background: var(--panel2);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 9px;
+    font: inherit;
+  }
+  textarea { min-height: 92px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  button {
+    background: var(--accent);
+    color: #04222e;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  button.ghost:hover { color: var(--fg); border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  .add-run { min-width: 340px; flex: 1 1 380px; }
+  .controls { min-width: 220px; }
+  .runs { min-width: 280px; flex: 1 1 300px; }
+
+  .stat-opts { display: flex; flex-wrap: wrap; gap: 6px; }
+  .stat-opts label {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 999px;
+    padding: 4px 10px; cursor: pointer; font-size: 13px;
+  }
+  .stat-opts input { accent-color: var(--accent); }
+
+  ul.runlist { list-style: none; margin: 0; padding: 0; }
+  ul.runlist li {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 4px; border-bottom: 1px solid var(--border);
+  }
+  ul.runlist li:last-child { border-bottom: none; }
+  .swatch { width: 14px; height: 14px; border-radius: 3px; flex: none; }
+  .runname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .runmeta { color: var(--muted); font-size: 11px; }
+  .runlist input[type=checkbox] { accent-color: var(--accent); }
+  .x { color: var(--muted); cursor: pointer; padding: 0 4px; font-size: 15px; }
+  .x:hover { color: #ff6b6b; }
+  .empty { color: var(--muted); font-style: italic; padding: 8px 4px; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0,1fr));
+    gap: 18px;
+  }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  .chartcard { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 12px 8px; }
+  .chartcard .ct { display:flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .chartcard .ct b { font-size: 14px; }
+  .chartcard .ct span { color: var(--muted); font-size: 12px; }
+  canvas { width: 100%; height: auto; display: block; cursor: crosshair; }
+
+  table.summary { border-collapse: collapse; width: 100%; margin-top: 22px; font-size: 13px; }
+  table.summary th, table.summary td { border: 1px solid var(--border); padding: 6px 10px; text-align: right; }
+  table.summary th { background: var(--panel2); color: var(--muted); font-weight: 600; }
+  table.summary td.run, table.summary th.run { text-align: left; }
+  table.summary td.metric-cell { vertical-align: middle; background: var(--panel); color: var(--fg); white-space: nowrap; }
+  table.summary th.runhdr { text-align: right; min-width: 92px; }
+  table.summary td.stat-name { text-align: left; color: var(--muted); }
+  table.summary td { font-variant-numeric: tabular-nums; }
+  table.summary tr.hi-row td { font-weight: 700; color: var(--fg); }
+  table.summary tr.hi-row td.stat-name { color: var(--accent); }
+  table.summary tbody tr:hover td { background: rgba(79,195,247,.06); }
+  table.summary caption { caption-side: bottom; text-align: left; color: var(--muted); font-size: 11px; padding: 9px 2px 0; line-height: 1.5; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; vertical-align: middle; }
+
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .err { color: #ff8a8a; font-size: 12px; margin-top: 6px; min-height: 14px; }
+
+  .info-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; margin-left: 6px;
+    border: 1px solid var(--muted); border-radius: 50%;
+    color: var(--muted); font: italic 700 10px/1 Georgia, "Times New Roman", serif;
+    cursor: help; position: relative; vertical-align: middle; user-select: none;
+    flex: none;
+  }
+  .info-icon:hover, .info-icon:focus { border-color: var(--accent); color: var(--accent); outline: none; }
+  .info-pop {
+    display: none; position: absolute; z-index: 40; top: 150%; left: 0;
+    width: 300px; max-width: 78vw;
+    background: #04121a; border: 1px solid var(--accent); border-radius: 8px;
+    padding: 11px 13px; box-shadow: 0 8px 28px rgba(0,0,0,.6);
+    color: var(--fg); font: 400 12px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-style: normal; text-align: left; white-space: normal; cursor: default;
+  }
+  .info-icon:hover .info-pop, .info-icon:focus .info-pop { display: block; }
+  .info-pop.flip-right { left: auto; right: 0; }
+  .info-pop .ip-title { display: block; font-weight: 600; margin-bottom: 7px; color: var(--fg); }
+  .info-pop .ip-lbl { color: var(--accent); font-weight: 700; text-transform: uppercase; letter-spacing: .04em; font-size: 10.5px; margin-right: 4px; }
+  .info-pop code { background: var(--panel2); border-radius: 3px; padding: 0 3px; font-size: 11px; }
+
+  #tooltip {
+    position: fixed; pointer-events: none; z-index: 10;
+    background: #04121a; border: 1px solid var(--accent); border-radius: 6px;
+    padding: 7px 9px; font-size: 12px; color: var(--fg);
+    box-shadow: 0 4px 16px rgba(0,0,0,.5); display: none; max-width: 280px;
+  }
+  #tooltip .tt-x { color: var(--muted); margin-bottom: 4px; }
+  #tooltip .tt-row { display:flex; align-items:center; gap:6px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Yellowstone latency — run comparison</h1>
+  <p>Paste <code>yellowstone_latency</code> log lines (raw plugin log or NDJSON) for each run. Charts overlay every run per metric so optimized vs. baseline can be compared on one page. Data is stored locally in your browser.</p>
+</header>
+
+<div class="wrap">
+  <div class="toolbar">
+    <div class="card add-run">
+      <h3>Add a run</h3>
+      <label class="fld" for="runLabel">Run label</label>
+      <input type="text" id="runLabel" placeholder="e.g. Optimized (opt1+opt2)" />
+      <label class="fld" for="runText">Paste log lines / NDJSON</label>
+      <textarea id="runText" placeholder='[... INFO  yellowstone_latency] {"ts_ms":...,"metric":"end_to_end",...}
+... or one JSON object per line'></textarea>
+      <div class="row" style="margin-top:10px;">
+        <button id="addBtn">Add run</button>
+        <button class="ghost" id="fileBtn">Load file…</button>
+        <input type="file" id="fileInput" accept=".log,.txt,.ndjson,.json" multiple style="display:none" />
+      </div>
+      <div class="err" id="addErr"></div>
+      <div class="hint">Capture with:<br><code>grep yellowstone_latency validator.log | sed 's/.*yellowstone_latency[^{]*//' &gt; run.ndjson</code></div>
+    </div>
+
+    <div class="card controls">
+      <h3>Percentile</h3>
+      <div class="stat-opts" id="statOpts">
+        <label><input type="radio" name="stat" value="p50"> p50</label>
+        <label><input type="radio" name="stat" value="p90"> p90</label>
+        <label><input type="radio" name="stat" value="p99" checked> p99</label>
+        <label><input type="radio" name="stat" value="max"> max</label>
+        <label><input type="radio" name="stat" value="mean"> mean</label>
+      </div>
+      <h3 style="margin-top:14px;">X axis</h3>
+      <div class="stat-opts" id="xOpts">
+        <label><input type="radio" name="xaxis" value="rel" checked> seconds into run</label>
+        <label><input type="radio" name="xaxis" value="abs"> wall clock</label>
+      </div>
+      <div class="hint" style="margin-top:12px;">“seconds into run” aligns runs that were captured at different times so they overlap.</div>
+    </div>
+
+    <div class="card runs">
+      <h3>Runs</h3>
+      <ul class="runlist" id="runList"></ul>
+      <div class="row" style="margin-top:10px;">
+        <button class="ghost" id="clearBtn">Clear all</button>
+        <button class="ghost" id="resetBtn">Restore defaults</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid" id="charts"></div>
+
+  <table class="summary" id="summary"></table>
+</div>
+
+<div id="tooltip"></div>
+
+<script>
+"use strict";
+
+// ---- metric definitions (chart order) ----
+const METRICS = [
+  {
+    key: "end_to_end", title: "End-to-end", unit: "µs",
+    desc: "geyser ingest → before client send",
+    info: `<span class="ip-lbl">What</span> Time from geyser ingesting the update (its <code>created_at</code>) to the moment just before the plugin hands the encoded message to the client's gRPC stream. Sampled per message in each client loop.<br><br><span class="ip-lbl">Why it matters</span> The top-line latency a subscriber actually experiences inside the plugin. The other three time metrics each explain a slice of where this time goes; queue depth explains the rest.`,
+  },
+  {
+    key: "producer_send", title: "Producer send", unit: "µs",
+    desc: "producer critical path · O(N) unopt / O(shards) opt",
+    info: `<span class="ip-lbl">What</span> Wall-clock time the producing task (the geyser loop) is blocked inside one broadcast send. Unoptimized: a single send wakes all N subscribers (O(N)). Optimized: the send only wakes the K relay tasks (O(shards)).<br><br><span class="ip-lbl">Why it matters</span> This is the single-task serialization point. If it climbs with subscriber count, every message is delayed at the source before fan-out even begins — the core scaling problem the sharded fan-out targets.`,
+  },
+  {
+    key: "fanout_send", title: "Fan-out send", unit: "µs",
+    desc: "per-task subscriber wake · O(N) unopt / O(N/shards) opt",
+    info: `<span class="ip-lbl">What</span> Time in the one send that actually wakes a subscriber set for the <code>processed</code> commitment. Unoptimized: the producer's single O(N) send (so it equals producer_send). Optimized: each relay's per-shard send (O(N/shards)).<br><br><span class="ip-lbl">Why it matters</span> The apples-to-apples per-task fan-out cost in both builds. It shows whether sharding genuinely divided the wake-all work (it should drop roughly shard-fold) rather than just moving it to a place that was previously untimed.`,
+  },
+  {
+    key: "filter_encode", title: "Filter + encode", unit: "µs",
+    desc: "per-message get_updates",
+    info: `<span class="ip-lbl">What</span> Per-message, per-subscriber cost of <code>Filter::get_updates</code> — filter matching plus building and encoding the <code>FilteredUpdate</code> — on the subscriber's own task.<br><br><span class="ip-lbl">Why it matters</span> Runs once per subscriber per message, so total cost scales with subscriber count and competes for the fixed worker-thread pool. A rise flags per-client CPU (e.g. data-slice re-encoding) as the bottleneck rather than fan-out.`,
+  },
+  {
+    key: "client_queue_depth", title: "Client queue depth", unit: "items",
+    desc: "outbound queue backpressure",
+    info: `<span class="ip-lbl">What</span> Number of messages waiting in a subscriber's outbound channel, sampled every client-loop iteration (per-client backpressure).<br><br><span class="ip-lbl">Why it matters</span> The clearest sign of consumer-side saturation. If it grows without bound, the client or network egress can't drain as fast as messages arrive, so end-to-end is dominated by queue-wait — and producer-side wins (producer_send / fanout_send) won't move end-to-end until this is relieved.`,
+  },
+];
+
+// Info "i" badge + hover/focus popover describing a metric.
+function infoIconHtml(m) {
+  return '<span class="info-icon" tabindex="0" role="button" aria-label="About ' + escapeHtml(m.title) + '">i' +
+    '<span class="info-pop"><span class="ip-title">' + escapeHtml(m.title) +
+    ' <span class="runmeta">(' + m.unit + ')</span></span>' + (m.info || "") + '</span></span>';
+}
+
+const PALETTE = ["#ff6b6b","#4fc3f7","#9ccc65","#ffb74d","#ba68c8","#4db6ac","#f06292","#fff176","#7986cb","#a1887f"];
+
+const STORE_KEY = "yellowstone_latency_runs_v11";
+
+// ---- baseline data (the unoptimized run) ----
+const BASELINE_LABEL = "Unoptimized (baseline)";
+const BASELINE_RAW = `
+[2026-05-25T10:37:20.792467382Z INFO  yellowstone_latency] {"ts_ms":1779705440792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4484,"p50":1,"p90":5,"p99":50,"max":173,"mean":2.17}
+[2026-05-25T10:37:30.792668785Z INFO  yellowstone_latency] {"ts_ms":1779705450792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":1557902,"p50":1000,"p90":5000,"p99":12555,"max":12555,"mean":1255.77}
+[2026-05-25T10:37:30.792701515Z INFO  yellowstone_latency] {"ts_ms":1779705450792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4692,"p50":1,"p90":20,"p99":50,"max":462,"mean":3.76}
+[2026-05-25T10:37:30.792710295Z INFO  yellowstone_latency] {"ts_ms":1779705450792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":1558242,"p50":1,"p90":1,"p99":1,"max":163,"mean":0.00}
+[2026-05-25T10:37:30.792719635Z INFO  yellowstone_latency] {"ts_ms":1779705450792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":57188,"p50":0,"p90":0,"p99":1,"max":2,"mean":0.04}
+[2026-05-25T10:37:40.792328408Z INFO  yellowstone_latency] {"ts_ms":1779705460792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8461769,"p50":1000,"p90":5000,"p99":17894,"max":17894,"mean":1363.00}
+[2026-05-25T10:37:40.792358178Z INFO  yellowstone_latency] {"ts_ms":1779705460792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4413,"p50":20,"p90":20,"p99":50,"max":151,"mean":10.73}
+[2026-05-25T10:37:40.792363278Z INFO  yellowstone_latency] {"ts_ms":1779705460792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8461429,"p50":1,"p90":1,"p99":1,"max":769,"mean":0.00}
+[2026-05-25T10:37:40.792367688Z INFO  yellowstone_latency] {"ts_ms":1779705460792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":308953,"p50":0,"p90":0,"p99":1,"max":4,"mean":0.03}
+[2026-05-25T10:37:50.792429192Z INFO  yellowstone_latency] {"ts_ms":1779705470792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8041530,"p50":1000,"p90":5000,"p99":15718,"max":15718,"mean":1474.18}
+[2026-05-25T10:37:50.792456752Z INFO  yellowstone_latency] {"ts_ms":1779705470792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4231,"p50":20,"p90":20,"p99":50,"max":286,"mean":10.81}
+[2026-05-25T10:37:50.792461962Z INFO  yellowstone_latency] {"ts_ms":1779705470792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8041530,"p50":1,"p90":1,"p99":1,"max":533,"mean":0.00}
+[2026-05-25T10:37:50.792466592Z INFO  yellowstone_latency] {"ts_ms":1779705470792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":296170,"p50":0,"p90":64,"p99":125,"max":125,"mean":9.58}
+[2026-05-25T10:38:00.792809065Z INFO  yellowstone_latency] {"ts_ms":1779705480792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8448300,"p50":1000,"p90":5000,"p99":18656,"max":18656,"mean":1485.13}
+[2026-05-25T10:38:00.792843135Z INFO  yellowstone_latency] {"ts_ms":1779705480792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4409,"p50":20,"p90":20,"p99":50,"max":324,"mean":10.64}
+[2026-05-25T10:38:00.792849475Z INFO  yellowstone_latency] {"ts_ms":1779705480792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8448300,"p50":1,"p90":1,"p99":1,"max":518,"mean":0.00}
+[2026-05-25T10:38:00.792855715Z INFO  yellowstone_latency] {"ts_ms":1779705480792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":308630,"p50":256,"p90":256,"p99":326,"max":326,"mean":169.70}
+[2026-05-25T10:38:10.792580848Z INFO  yellowstone_latency] {"ts_ms":1779705490792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8412110,"p50":1000,"p90":5000,"p99":20000,"max":21526,"mean":1404.26}
+[2026-05-25T10:38:10.792609618Z INFO  yellowstone_latency] {"ts_ms":1779705490792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4383,"p50":20,"p90":50,"p99":50,"max":333,"mean":11.57}
+[2026-05-25T10:38:10.792614838Z INFO  yellowstone_latency] {"ts_ms":1779705490792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8412110,"p50":1,"p90":1,"p99":1,"max":512,"mean":0.00}
+[2026-05-25T10:38:10.792619318Z INFO  yellowstone_latency] {"ts_ms":1779705490792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":306810,"p50":500,"p90":500,"p99":500,"max":500,"mean":343.80}
+[2026-05-25T10:38:20.793044832Z INFO  yellowstone_latency] {"ts_ms":1779705500793,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8442490,"p50":1000,"p90":5000,"p99":17507,"max":17507,"mean":1373.45}
+[2026-05-25T10:38:20.793091472Z INFO  yellowstone_latency] {"ts_ms":1779705500793,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4351,"p50":20,"p90":20,"p99":50,"max":146,"mean":10.83}
+[2026-05-25T10:38:20.793099682Z INFO  yellowstone_latency] {"ts_ms":1779705500793,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8442490,"p50":1,"p90":1,"p99":1,"max":3391,"mean":0.00}
+[2026-05-25T10:38:20.793106842Z INFO  yellowstone_latency] {"ts_ms":1779705500793,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":304570,"p50":688,"p90":688,"p99":688,"max":688,"mean":527.57}
+[2026-05-25T10:38:30.792766564Z INFO  yellowstone_latency] {"ts_ms":1779705510792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8223810,"p50":1000,"p90":5000,"p99":17408,"max":17408,"mean":1355.17}
+[2026-05-25T10:38:30.792795345Z INFO  yellowstone_latency] {"ts_ms":1779705510792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4326,"p50":20,"p90":20,"p99":50,"max":253,"mean":10.31}
+[2026-05-25T10:38:30.792801545Z INFO  yellowstone_latency] {"ts_ms":1779705510792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8223810,"p50":1,"p90":1,"p99":1,"max":586,"mean":0.00}
+[2026-05-25T10:38:30.792807325Z INFO  yellowstone_latency] {"ts_ms":1779705510792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":302820,"p50":833,"p90":833,"p99":833,"max":833,"mean":681.33}
+[2026-05-25T10:38:40.792724248Z INFO  yellowstone_latency] {"ts_ms":1779705520792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8581860,"p50":1000,"p90":5000,"p99":20000,"max":26462,"mean":1411.25}
+[2026-05-25T10:38:40.792758188Z INFO  yellowstone_latency] {"ts_ms":1779705520792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4486,"p50":20,"p90":20,"p99":50,"max":207,"mean":10.85}
+[2026-05-25T10:38:40.792763208Z INFO  yellowstone_latency] {"ts_ms":1779705520792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8581860,"p50":1,"p90":1,"p99":1,"max":1187,"mean":0.00}
+[2026-05-25T10:38:40.792767708Z INFO  yellowstone_latency] {"ts_ms":1779705520792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":314020,"p50":1024,"p90":1024,"p99":1024,"max":1027,"mean":834.06}
+[2026-05-25T10:38:50.792697661Z INFO  yellowstone_latency] {"ts_ms":1779705530792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8472590,"p50":1000,"p90":5000,"p99":17006,"max":17006,"mean":1298.41}
+[2026-05-25T10:38:50.792730401Z INFO  yellowstone_latency] {"ts_ms":1779705530792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4427,"p50":20,"p90":20,"p99":50,"max":661,"mean":11.03}
+[2026-05-25T10:38:50.792737851Z INFO  yellowstone_latency] {"ts_ms":1779705530792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8472590,"p50":1,"p90":1,"p99":1,"max":418,"mean":0.00}
+[2026-05-25T10:38:50.792743981Z INFO  yellowstone_latency] {"ts_ms":1779705530792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":309890,"p50":1024,"p90":1128,"p99":1128,"max":1128,"mean":990.64}
+[2026-05-25T10:39:00.792727524Z INFO  yellowstone_latency] {"ts_ms":1779705540792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8688120,"p50":1000,"p90":5000,"p99":20000,"max":21856,"mean":1432.97}
+[2026-05-25T10:39:00.792749174Z INFO  yellowstone_latency] {"ts_ms":1779705540792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4511,"p50":20,"p90":20,"p99":50,"max":258,"mean":10.40}
+[2026-05-25T10:39:00.792754364Z INFO  yellowstone_latency] {"ts_ms":1779705540792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8688120,"p50":1,"p90":1,"p99":1,"max":701,"mean":0.00}
+[2026-05-25T10:39:00.792759214Z INFO  yellowstone_latency] {"ts_ms":1779705540792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":315770,"p50":1192,"p90":1192,"p99":1192,"max":1192,"mean":1058.30}
+[2026-05-25T10:39:10.792272727Z INFO  yellowstone_latency] {"ts_ms":1779705550792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8878240,"p50":1000,"p90":5000,"p99":18208,"max":18208,"mean":1359.34}
+[2026-05-25T10:39:10.792304177Z INFO  yellowstone_latency] {"ts_ms":1779705550792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4622,"p50":20,"p90":20,"p99":50,"max":223,"mean":11.23}
+[2026-05-25T10:39:10.792309247Z INFO  yellowstone_latency] {"ts_ms":1779705550792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8878240,"p50":1,"p90":1,"p99":1,"max":632,"mean":0.00}
+[2026-05-25T10:39:10.792313747Z INFO  yellowstone_latency] {"ts_ms":1779705550792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":323540,"p50":1255,"p90":1255,"p99":1255,"max":1255,"mean":1116.70}
+[2026-05-25T10:39:20.792796730Z INFO  yellowstone_latency] {"ts_ms":1779705560792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8244022,"p50":2000,"p90":5000,"p99":20000,"max":21183,"mean":1550.91}
+[2026-05-25T10:39:20.792831980Z INFO  yellowstone_latency] {"ts_ms":1779705560792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4313,"p50":20,"p90":20,"p99":50,"max":132,"mean":10.27}
+[2026-05-25T10:39:20.792838700Z INFO  yellowstone_latency] {"ts_ms":1779705560792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8244415,"p50":1,"p90":1,"p99":1,"max":433,"mean":0.00}
+[2026-05-25T10:39:20.792845730Z INFO  yellowstone_latency] {"ts_ms":1779705560792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":301561,"p50":1314,"p90":1314,"p99":1314,"max":1314,"mean":1173.31}
+[2026-05-25T10:39:30.792313033Z INFO  yellowstone_latency] {"ts_ms":1779705570792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8198068,"p50":1000,"p90":5000,"p99":18213,"max":18213,"mean":1430.12}
+[2026-05-25T10:39:30.792349513Z INFO  yellowstone_latency] {"ts_ms":1779705570792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4282,"p50":20,"p90":20,"p99":50,"max":227,"mean":10.69}
+[2026-05-25T10:39:30.792356813Z INFO  yellowstone_latency] {"ts_ms":1779705570792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8197675,"p50":1,"p90":1,"p99":1,"max":236,"mean":0.00}
+[2026-05-25T10:39:30.792363193Z INFO  yellowstone_latency] {"ts_ms":1779705570792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":300089,"p50":1428,"p90":1428,"p99":1428,"max":1428,"mean":1259.87}
+[2026-05-25T10:39:40.792425196Z INFO  yellowstone_latency] {"ts_ms":1779705580792,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":4774560,"p50":1000,"p90":5000,"p99":20000,"max":20847,"mean":1355.82}
+[2026-05-25T10:39:40.792451396Z INFO  yellowstone_latency] {"ts_ms":1779705580792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4981,"p50":2,"p90":20,"p99":50,"max":1054,"mean":6.55}
+[2026-05-25T10:39:40.792456566Z INFO  yellowstone_latency] {"ts_ms":1779705580792,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":4774560,"p50":1,"p90":1,"p99":1,"max":279,"mean":0.00}
+[2026-05-25T10:39:40.792461026Z INFO  yellowstone_latency] {"ts_ms":1779705580792,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":174370,"p50":1469,"p90":1469,"p99":1469,"max":1469,"mean":1312.03}
+[2026-05-25T10:39:50.792841600Z INFO  yellowstone_latency] {"ts_ms":1779705590792,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5192,"p50":1,"p90":5,"p99":50,"max":189,"mean":2.12}
+`;
+
+// ---- apples-to-apples unoptimized run (unop-metrics branch; includes fanout_send) ----
+const UNOPT_LABEL = "Unoptimized · 100 subscribers";
+const UNOPT_RAW = `
+[2026-05-25T13:21:13.742862553Z INFO  yellowstone_latency] {"ts_ms":1779715273742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5600,"p50":1,"p90":5,"p99":50,"max":2303,"mean":3.69}
+[2026-05-25T13:21:13.742891083Z INFO  yellowstone_latency] {"ts_ms":1779715273742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5290,"p50":1,"p90":5,"p99":10,"max":2303,"mean":3.33}
+[2026-05-25T13:21:23.743453982Z INFO  yellowstone_latency] {"ts_ms":1779715283743,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5090,"p50":1,"p90":5,"p99":50,"max":1313,"mean":3.91}
+[2026-05-25T13:21:23.743489482Z INFO  yellowstone_latency] {"ts_ms":1779715283743,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4790,"p50":1,"p90":5,"p99":10,"max":1313,"mean":3.54}
+[2026-05-25T13:21:33.742951060Z INFO  yellowstone_latency] {"ts_ms":1779715293742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5215,"p50":1,"p90":5,"p99":50,"max":1038,"mean":2.93}
+[2026-05-25T13:21:33.742980070Z INFO  yellowstone_latency] {"ts_ms":1779715293742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4901,"p50":1,"p90":5,"p99":10,"max":1038,"mean":2.49}
+[2026-05-25T13:21:43.742791748Z INFO  yellowstone_latency] {"ts_ms":1779715303742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":3840999,"p50":2000,"p90":5000,"p99":18179,"max":18179,"mean":1863.43}
+[2026-05-25T13:21:43.742828808Z INFO  yellowstone_latency] {"ts_ms":1779715303742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5980,"p50":1,"p90":20,"p99":50,"max":208,"mean":4.78}
+[2026-05-25T13:21:43.742835268Z INFO  yellowstone_latency] {"ts_ms":1779715303742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5704,"p50":1,"p90":20,"p99":50,"max":132,"mean":4.58}
+[2026-05-25T13:21:43.742841508Z INFO  yellowstone_latency] {"ts_ms":1779715303742,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":3841591,"p50":1,"p90":1,"p99":1,"max":281,"mean":0.00}
+[2026-05-25T13:21:43.742848458Z INFO  yellowstone_latency] {"ts_ms":1779715303742,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":132779,"p50":32,"p90":106,"p99":106,"max":106,"mean":28.88}
+[2026-05-25T13:21:53.742787237Z INFO  yellowstone_latency] {"ts_ms":1779715313742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":16150801,"p50":1000,"p90":5000,"p99":14251,"max":14251,"mean":1478.27}
+[2026-05-25T13:21:53.742807437Z INFO  yellowstone_latency] {"ts_ms":1779715313742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5705,"p50":20,"p90":50,"p99":50,"max":144,"mean":14.77}
+[2026-05-25T13:21:53.742812467Z INFO  yellowstone_latency] {"ts_ms":1779715313742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5395,"p50":20,"p90":50,"p99":50,"max":144,"mean":15.62}
+[2026-05-25T13:21:53.742816817Z INFO  yellowstone_latency] {"ts_ms":1779715313742,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":16150209,"p50":1,"p90":1,"p99":1,"max":935,"mean":0.00}
+[2026-05-25T13:21:53.742821387Z INFO  yellowstone_latency] {"ts_ms":1779715313742,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":570621,"p50":512,"p90":897,"p99":897,"max":897,"mean":500.02}
+[2026-05-25T13:22:03.742648765Z INFO  yellowstone_latency] {"ts_ms":1779715323742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":15974724,"p50":1000,"p90":5000,"p99":14697,"max":14697,"mean":1518.97}
+[2026-05-25T13:22:03.742686285Z INFO  yellowstone_latency] {"ts_ms":1779715323742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5648,"p50":20,"p90":50,"p99":50,"max":218,"mean":15.36}
+[2026-05-25T13:22:03.742691805Z INFO  yellowstone_latency] {"ts_ms":1779715323742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5356,"p50":20,"p90":50,"p99":50,"max":218,"mean":16.19}
+[2026-05-25T13:22:03.742696045Z INFO  yellowstone_latency] {"ts_ms":1779715323742,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":15974783,"p50":1,"p90":1,"p99":1,"max":371,"mean":0.00}
+[2026-05-25T13:22:03.742701435Z INFO  yellowstone_latency] {"ts_ms":1779715323742,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":564787,"p50":1596,"p90":1596,"p99":1596,"max":1596,"mean":1222.18}
+[2026-05-25T13:22:13.742677344Z INFO  yellowstone_latency] {"ts_ms":1779715333742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":15787076,"p50":2000,"p90":5000,"p99":17758,"max":17758,"mean":1508.66}
+[2026-05-25T13:22:13.742701524Z INFO  yellowstone_latency] {"ts_ms":1779715333742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5634,"p50":20,"p90":50,"p99":50,"max":128,"mean":13.79}
+[2026-05-25T13:22:13.742706594Z INFO  yellowstone_latency] {"ts_ms":1779715333742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5314,"p50":20,"p90":50,"p99":50,"max":128,"mean":14.62}
+[2026-05-25T13:22:13.742714194Z INFO  yellowstone_latency] {"ts_ms":1779715333742,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":15787017,"p50":1,"p90":1,"p99":1,"max":937,"mean":0.00}
+[2026-05-25T13:22:13.742719444Z INFO  yellowstone_latency] {"ts_ms":1779715333742,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":563413,"p50":2241,"p90":2241,"p99":2241,"max":2241,"mean":1904.50}
+[2026-05-25T13:22:23.742893362Z INFO  yellowstone_latency] {"ts_ms":1779715343742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14717279,"p50":2000,"p90":5000,"p99":18740,"max":18740,"mean":1662.52}
+[2026-05-25T13:22:23.742974212Z INFO  yellowstone_latency] {"ts_ms":1779715343742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5245,"p50":20,"p90":50,"p99":50,"max":256,"mean":14.22}
+[2026-05-25T13:22:23.742999532Z INFO  yellowstone_latency] {"ts_ms":1779715343742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4955,"p50":20,"p90":50,"p99":50,"max":256,"mean":15.03}
+[2026-05-25T13:22:23.743020632Z INFO  yellowstone_latency] {"ts_ms":1779715343743,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14718570,"p50":1,"p90":1,"p99":1,"max":577,"mean":0.00}
+[2026-05-25T13:22:23.743042672Z INFO  yellowstone_latency] {"ts_ms":1779715343743,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":524394,"p50":3020,"p90":3020,"p99":3020,"max":3020,"mean":2602.71}
+[2026-05-25T13:22:33.742840631Z INFO  yellowstone_latency] {"ts_ms":1779715353742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":13984349,"p50":2000,"p90":5000,"p99":19656,"max":19656,"mean":1760.42}
+[2026-05-25T13:22:33.742872051Z INFO  yellowstone_latency] {"ts_ms":1779715353742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5037,"p50":20,"p90":50,"p99":50,"max":580,"mean":13.63}
+[2026-05-25T13:22:33.742877041Z INFO  yellowstone_latency] {"ts_ms":1779715353742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4739,"p50":20,"p90":50,"p99":50,"max":580,"mean":14.48}
+[2026-05-25T13:22:33.742881621Z INFO  yellowstone_latency] {"ts_ms":1779715353742,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":13983508,"p50":1,"p90":1,"p99":1,"max":469,"mean":0.00}
+[2026-05-25T13:22:33.742886081Z INFO  yellowstone_latency] {"ts_ms":1779715353742,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":503653,"p50":3733,"p90":3733,"p99":3733,"max":3733,"mean":3326.79}
+[2026-05-25T13:22:43.742787979Z INFO  yellowstone_latency] {"ts_ms":1779715363742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14093472,"p50":2000,"p90":5000,"p99":17164,"max":17164,"mean":1567.76}
+[2026-05-25T13:22:43.742825529Z INFO  yellowstone_latency] {"ts_ms":1779715363742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5053,"p50":20,"p90":50,"p99":50,"max":98,"mean":14.49}
+[2026-05-25T13:22:43.742832239Z INFO  yellowstone_latency] {"ts_ms":1779715363742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4749,"p50":20,"p90":50,"p99":50,"max":98,"mean":15.42}
+[2026-05-25T13:22:43.742851079Z INFO  yellowstone_latency] {"ts_ms":1779715363742,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14093022,"p50":1,"p90":1,"p99":1,"max":579,"mean":0.00}
+[2026-05-25T13:22:43.742858339Z INFO  yellowstone_latency] {"ts_ms":1779715363742,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":505453,"p50":4096,"p90":4480,"p99":4480,"max":4480,"mean":4062.86}
+[2026-05-25T13:22:53.743584398Z INFO  yellowstone_latency] {"ts_ms":1779715373743,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14325100,"p50":2000,"p90":5000,"p99":18265,"max":18265,"mean":1649.59}
+[2026-05-25T13:22:53.743605038Z INFO  yellowstone_latency] {"ts_ms":1779715373743,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5155,"p50":20,"p90":50,"p99":50,"max":146,"mean":14.17}
+[2026-05-25T13:22:53.743609858Z INFO  yellowstone_latency] {"ts_ms":1779715373743,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4847,"p50":20,"p90":50,"p99":50,"max":146,"mean":15.05}
+[2026-05-25T13:22:53.743614178Z INFO  yellowstone_latency] {"ts_ms":1779715373743,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14325100,"p50":1,"p90":1,"p99":1,"max":264,"mean":0.00}
+[2026-05-25T13:22:53.743618848Z INFO  yellowstone_latency] {"ts_ms":1779715373743,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":515500,"p50":5054,"p90":5054,"p99":5054,"max":5054,"mean":4741.54}
+[2026-05-25T13:23:03.743304916Z INFO  yellowstone_latency] {"ts_ms":1779715383743,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14577900,"p50":2000,"p90":5000,"p99":18781,"max":18781,"mean":1638.07}
+[2026-05-25T13:23:03.743336176Z INFO  yellowstone_latency] {"ts_ms":1779715383743,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5197,"p50":20,"p90":50,"p99":50,"max":392,"mean":14.06}
+[2026-05-25T13:23:03.743341276Z INFO  yellowstone_latency] {"ts_ms":1779715383743,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4907,"p50":20,"p90":50,"p99":50,"max":392,"mean":14.88}
+[2026-05-25T13:23:03.743346646Z INFO  yellowstone_latency] {"ts_ms":1779715383743,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14577900,"p50":1,"p90":1,"p99":1,"max":707,"mean":0.00}
+[2026-05-25T13:23:03.743352696Z INFO  yellowstone_latency] {"ts_ms":1779715383743,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":519700,"p50":5562,"p90":5562,"p99":5562,"max":5562,"mean":5250.55}
+[2026-05-25T13:23:13.742770434Z INFO  yellowstone_latency] {"ts_ms":1779715393742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14809900,"p50":2000,"p90":5000,"p99":19980,"max":19980,"mean":1543.08}
+[2026-05-25T13:23:13.742791054Z INFO  yellowstone_latency] {"ts_ms":1779715393742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5296,"p50":20,"p90":50,"p99":50,"max":160,"mean":14.19}
+[2026-05-25T13:23:13.742807774Z INFO  yellowstone_latency] {"ts_ms":1779715393742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4990,"p50":20,"p90":50,"p99":50,"max":160,"mean":15.05}
+[2026-05-25T13:23:13.742813994Z INFO  yellowstone_latency] {"ts_ms":1779715393742,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14809900,"p50":1,"p90":1,"p99":1,"max":516,"mean":0.00}
+[2026-05-25T13:23:13.742821254Z INFO  yellowstone_latency] {"ts_ms":1779715393742,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":529600,"p50":6074,"p90":6074,"p99":6074,"max":6074,"mean":5754.06}
+[2026-05-25T13:23:23.742911823Z INFO  yellowstone_latency] {"ts_ms":1779715403742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14164300,"p50":2000,"p90":5000,"p99":20000,"max":23322,"mean":1645.81}
+[2026-05-25T13:23:23.742941223Z INFO  yellowstone_latency] {"ts_ms":1779715403742,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5125,"p50":20,"p90":50,"p99":50,"max":176,"mean":13.08}
+[2026-05-25T13:23:23.742946483Z INFO  yellowstone_latency] {"ts_ms":1779715403742,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4797,"p50":20,"p90":50,"p99":50,"max":176,"mean":13.93}
+[2026-05-25T13:23:23.742950503Z INFO  yellowstone_latency] {"ts_ms":1779715403742,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14164300,"p50":1,"p90":1,"p99":1,"max":1310,"mean":0.00}
+[2026-05-25T13:23:23.742955103Z INFO  yellowstone_latency] {"ts_ms":1779715403742,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":512500,"p50":6566,"p90":6566,"p99":6566,"max":6566,"mean":6259.74}
+[2026-05-25T13:23:33.743273361Z INFO  yellowstone_latency] {"ts_ms":1779715413743,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":13533706,"p50":2000,"p90":5000,"p99":20000,"max":27896,"mean":1851.23}
+[2026-05-25T13:23:33.743298731Z INFO  yellowstone_latency] {"ts_ms":1779715413743,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4906,"p50":20,"p90":50,"p99":50,"max":148,"mean":13.22}
+[2026-05-25T13:23:33.743305771Z INFO  yellowstone_latency] {"ts_ms":1779715413743,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4592,"p50":20,"p90":50,"p99":50,"max":148,"mean":14.11}
+[2026-05-25T13:23:33.743312121Z INFO  yellowstone_latency] {"ts_ms":1779715413743,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":13534200,"p50":1,"p90":1,"p99":1,"max":1026,"mean":0.00}
+[2026-05-25T13:23:33.743318851Z INFO  yellowstone_latency] {"ts_ms":1779715413743,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":490528,"p50":7045,"p90":7045,"p99":7045,"max":7045,"mean":6753.26}
+[2026-05-25T13:23:43.742998869Z INFO  yellowstone_latency] {"ts_ms":1779715423742,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":12698362,"p50":2000,"p90":5000,"p99":20000,"max":35482,"mean":1773.31}
+[2026-05-25T13:23:43.743023219Z INFO  yellowstone_latency] {"ts_ms":1779715423743,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4607,"p50":20,"p90":50,"p99":50,"max":184,"mean":13.99}
+[2026-05-25T13:23:43.743028139Z INFO  yellowstone_latency] {"ts_ms":1779715423743,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4307,"p50":20,"p90":50,"p99":50,"max":184,"mean":14.94}
+[2026-05-25T13:23:43.743032369Z INFO  yellowstone_latency] {"ts_ms":1779715423743,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":12698168,"p50":1,"p90":1,"p99":1,"max":516,"mean":0.00}
+[2026-05-25T13:23:43.743036999Z INFO  yellowstone_latency] {"ts_ms":1779715423743,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":460598,"p50":7401,"p90":7401,"p99":7401,"max":7401,"mean":7154.29}
+[2026-05-25T13:23:53.743215518Z INFO  yellowstone_latency] {"ts_ms":1779715433743,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":10879432,"p50":2000,"p90":5000,"p99":20000,"max":26389,"mean":1593.80}
+[2026-05-25T13:23:53.743250608Z INFO  yellowstone_latency] {"ts_ms":1779715433743,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4697,"p50":10,"p90":50,"p99":50,"max":138,"mean":11.52}
+[2026-05-25T13:23:53.743255708Z INFO  yellowstone_latency] {"ts_ms":1779715433743,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4399,"p50":10,"p90":50,"p99":50,"max":138,"mean":12.18}
+[2026-05-25T13:23:53.743260228Z INFO  yellowstone_latency] {"ts_ms":1779715433743,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":10879132,"p50":1,"p90":1,"p99":1,"max":784,"mean":0.00}
+[2026-05-25T13:23:53.743280768Z INFO  yellowstone_latency] {"ts_ms":1779715433743,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":392874,"p50":7695,"p90":7695,"p99":7695,"max":7695,"mean":7460.07}
+`;
+
+// ---- apples-to-apples optimized run (optimization branch; opt1 + opt2, with fanout_send) ----
+// NB: the 13:33:29 end_to_end line arrived truncated in the source log; reconstructed
+// from its window values (ts_ms 1779716009773), the only field cut was the JSON prefix.
+const OPT_AA_LABEL = "Optimized (opt1 + opt2) · 100 subscribers";
+const OPT_AA_RAW = `
+[2026-05-25T13:33:29.773000000Z INFO  yellowstone_latency] {"ts_ms":1779716009773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8452723,"p50":2000,"p90":5000,"p99":18800,"max":18800,"mean":1829.34}
+[2026-05-25T13:33:29.773017393Z INFO  yellowstone_latency] {"ts_ms":1779716009773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4792,"p50":1,"p90":1,"p99":50,"max":554,"mean":1.55}
+[2026-05-25T13:33:29.773026243Z INFO  yellowstone_latency] {"ts_ms":1779716009773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18056,"p50":1,"p90":10,"p99":10,"max":407,"mean":2.64}
+[2026-05-25T13:33:29.773035293Z INFO  yellowstone_latency] {"ts_ms":1779716009773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8453381,"p50":1,"p90":1,"p99":1,"max":768,"mean":0.00}
+[2026-05-25T13:33:29.773043923Z INFO  yellowstone_latency] {"ts_ms":1779716009773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":284081,"p50":64,"p90":184,"p99":184,"max":184,"mean":57.53}
+[2026-05-25T13:33:39.772588641Z INFO  yellowstone_latency] {"ts_ms":1779716019772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":13628646,"p50":2000,"p90":5000,"p99":20000,"max":23103,"mean":1662.02}
+[2026-05-25T13:33:39.772615791Z INFO  yellowstone_latency] {"ts_ms":1779716019772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4904,"p50":1,"p90":1,"p99":50,"max":208,"mean":1.61}
+[2026-05-25T13:33:39.772620752Z INFO  yellowstone_latency] {"ts_ms":1779716019772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18416,"p50":5,"p90":10,"p99":10,"max":161,"mean":3.81}
+[2026-05-25T13:33:39.772625582Z INFO  yellowstone_latency] {"ts_ms":1779716019772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":13628286,"p50":1,"p90":1,"p99":1,"max":322,"mean":0.00}
+[2026-05-25T13:33:39.772631112Z INFO  yellowstone_latency] {"ts_ms":1779716019772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":460428,"p50":512,"p90":640,"p99":640,"max":640,"mean":403.22}
+[2026-05-25T13:33:49.772655920Z INFO  yellowstone_latency] {"ts_ms":1779716029772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14433431,"p50":2000,"p90":5000,"p99":20000,"max":23844,"mean":1653.45}
+[2026-05-25T13:33:49.772684010Z INFO  yellowstone_latency] {"ts_ms":1779716029772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5171,"p50":1,"p90":1,"p99":50,"max":225,"mean":1.65}
+[2026-05-25T13:33:49.772688690Z INFO  yellowstone_latency] {"ts_ms":1779716029772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19484,"p50":5,"p90":10,"p99":10,"max":648,"mean":3.54}
+[2026-05-25T13:33:49.772692440Z INFO  yellowstone_latency] {"ts_ms":1779716029772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14433133,"p50":1,"p90":1,"p99":1,"max":569,"mean":0.00}
+[2026-05-25T13:33:49.772696740Z INFO  yellowstone_latency] {"ts_ms":1779716029772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":487103,"p50":993,"p90":993,"p99":993,"max":993,"mean":789.28}
+[2026-05-25T13:33:59.772932529Z INFO  yellowstone_latency] {"ts_ms":1779716039772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":11928800,"p50":2000,"p90":5000,"p99":20000,"max":25033,"mean":1910.06}
+[2026-05-25T13:33:59.772960059Z INFO  yellowstone_latency] {"ts_ms":1779716039772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4343,"p50":1,"p90":1,"p99":50,"max":650,"mean":2.07}
+[2026-05-25T13:33:59.772964829Z INFO  yellowstone_latency] {"ts_ms":1779716039772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":16220,"p50":5,"p90":10,"p99":10,"max":117,"mean":3.52}
+[2026-05-25T13:33:59.772981809Z INFO  yellowstone_latency] {"ts_ms":1779716039772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":11928800,"p50":1,"p90":1,"p99":1,"max":1654,"mean":0.00}
+[2026-05-25T13:33:59.772987239Z INFO  yellowstone_latency] {"ts_ms":1779716039772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":405500,"p50":1340,"p90":1340,"p99":1340,"max":1340,"mean":1132.64}
+[2026-05-25T13:34:09.773061208Z INFO  yellowstone_latency] {"ts_ms":1779716049773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":12458900,"p50":2000,"p90":5000,"p99":20000,"max":26506,"mean":1700.23}
+[2026-05-25T13:34:09.773083738Z INFO  yellowstone_latency] {"ts_ms":1779716049773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4521,"p50":1,"p90":1,"p99":50,"max":143,"mean":1.56}
+[2026-05-25T13:34:09.773092698Z INFO  yellowstone_latency] {"ts_ms":1779716049773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":16932,"p50":5,"p90":10,"p99":10,"max":392,"mean":3.55}
+[2026-05-25T13:34:09.773098218Z INFO  yellowstone_latency] {"ts_ms":1779716049773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":12458900,"p50":1,"p90":1,"p99":1,"max":1363,"mean":0.00}
+[2026-05-25T13:34:09.773103738Z INFO  yellowstone_latency] {"ts_ms":1779716049773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":423300,"p50":1657,"p90":1657,"p99":1657,"max":1657,"mean":1464.07}
+[2026-05-25T13:34:19.773518137Z INFO  yellowstone_latency] {"ts_ms":1779716059773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":13324800,"p50":2000,"p90":5000,"p99":20000,"max":23550,"mean":2078.19}
+[2026-05-25T13:34:19.773546767Z INFO  yellowstone_latency] {"ts_ms":1779716059773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4791,"p50":1,"p90":1,"p99":50,"max":309,"mean":1.78}
+[2026-05-25T13:34:19.773551557Z INFO  yellowstone_latency] {"ts_ms":1779716059773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18012,"p50":5,"p90":10,"p99":10,"max":96,"mean":3.47}
+[2026-05-25T13:34:19.773555447Z INFO  yellowstone_latency] {"ts_ms":1779716059773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":13324800,"p50":1,"p90":1,"p99":1,"max":797,"mean":0.00}
+[2026-05-25T13:34:19.773560177Z INFO  yellowstone_latency] {"ts_ms":1779716059773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":450300,"p50":2010,"p90":2010,"p99":2010,"max":2010,"mean":1790.31}
+[2026-05-25T13:34:29.773444236Z INFO  yellowstone_latency] {"ts_ms":1779716069773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":12607100,"p50":2000,"p90":5000,"p99":15026,"max":15026,"mean":1773.29}
+[2026-05-25T13:34:29.773468596Z INFO  yellowstone_latency] {"ts_ms":1779716069773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4580,"p50":1,"p90":2,"p99":50,"max":283,"mean":1.81}
+[2026-05-25T13:34:29.773474526Z INFO  yellowstone_latency] {"ts_ms":1779716069773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":17120,"p50":5,"p90":10,"p99":10,"max":515,"mean":3.91}
+[2026-05-25T13:34:29.773479366Z INFO  yellowstone_latency] {"ts_ms":1779716069773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":12607100,"p50":1,"p90":1,"p99":1,"max":551,"mean":0.00}
+[2026-05-25T13:34:29.773484906Z INFO  yellowstone_latency] {"ts_ms":1779716069773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":428000,"p50":2311,"p90":2311,"p99":2311,"max":2311,"mean":2126.68}
+[2026-05-25T13:34:39.772625754Z INFO  yellowstone_latency] {"ts_ms":1779716079772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14637400,"p50":2000,"p90":5000,"p99":20000,"max":126953,"mean":2070.44}
+[2026-05-25T13:34:39.772652004Z INFO  yellowstone_latency] {"ts_ms":1779716079772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5245,"p50":1,"p90":1,"p99":50,"max":244,"mean":1.76}
+[2026-05-25T13:34:39.772678794Z INFO  yellowstone_latency] {"ts_ms":1779716079772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19740,"p50":5,"p90":10,"p99":10,"max":153,"mean":3.71}
+[2026-05-25T13:34:39.772683134Z INFO  yellowstone_latency] {"ts_ms":1779716079772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14637400,"p50":1,"p90":1,"p99":1,"max":733,"mean":0.00}
+[2026-05-25T13:34:39.772687984Z INFO  yellowstone_latency] {"ts_ms":1779716079772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":493500,"p50":2414,"p90":2414,"p99":2414,"max":2414,"mean":2318.00}
+[2026-05-25T13:34:49.773084503Z INFO  yellowstone_latency] {"ts_ms":1779716089773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":17221900,"p50":2000,"p90":5000,"p99":20000,"max":26022,"mean":1599.12}
+[2026-05-25T13:34:49.773107623Z INFO  yellowstone_latency] {"ts_ms":1779716089773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":6062,"p50":1,"p90":1,"p99":20,"max":157,"mean":1.50}
+[2026-05-25T13:34:49.773112633Z INFO  yellowstone_latency] {"ts_ms":1779716089773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":23032,"p50":5,"p90":10,"p99":10,"max":125,"mean":3.63}
+[2026-05-25T13:34:49.773116603Z INFO  yellowstone_latency] {"ts_ms":1779716089773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":17221900,"p50":1,"p90":1,"p99":1,"max":754,"mean":0.00}
+[2026-05-25T13:34:49.773121203Z INFO  yellowstone_latency] {"ts_ms":1779716089773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":575800,"p50":2494,"p90":2494,"p99":2494,"max":2494,"mean":2384.12}
+[2026-05-25T13:34:59.773095412Z INFO  yellowstone_latency] {"ts_ms":1779716099773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":18801700,"p50":2000,"p90":5000,"p99":20000,"max":27010,"mean":1825.36}
+[2026-05-25T13:34:59.773120582Z INFO  yellowstone_latency] {"ts_ms":1779716099773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":6525,"p50":1,"p90":1,"p99":10,"max":298,"mean":1.49}
+[2026-05-25T13:34:59.773125452Z INFO  yellowstone_latency] {"ts_ms":1779716099773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":24956,"p50":5,"p90":10,"p99":10,"max":263,"mean":3.79}
+[2026-05-25T13:34:59.773129662Z INFO  yellowstone_latency] {"ts_ms":1779716099773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":18801700,"p50":1,"p90":1,"p99":1,"max":585,"mean":0.00}
+[2026-05-25T13:34:59.773135502Z INFO  yellowstone_latency] {"ts_ms":1779716099773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":623900,"p50":2538,"p90":2538,"p99":2538,"max":2538,"mean":2444.57}
+[2026-05-25T13:35:09.773369631Z INFO  yellowstone_latency] {"ts_ms":1779716109773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":18765200,"p50":1000,"p90":5000,"p99":20000,"max":21277,"mean":1668.52}
+[2026-05-25T13:35:09.773394471Z INFO  yellowstone_latency] {"ts_ms":1779716109773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":6544,"p50":1,"p90":1,"p99":10,"max":228,"mean":1.38}
+[2026-05-25T13:35:09.773399561Z INFO  yellowstone_latency] {"ts_ms":1779716109773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":24984,"p50":5,"p90":10,"p99":10,"max":162,"mean":3.71}
+[2026-05-25T13:35:09.773403631Z INFO  yellowstone_latency] {"ts_ms":1779716109773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":18765200,"p50":1,"p90":1,"p99":1,"max":706,"mean":0.00}
+[2026-05-25T13:35:09.773407911Z INFO  yellowstone_latency] {"ts_ms":1779716109773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":624600,"p50":2580,"p90":2580,"p99":2580,"max":2580,"mean":2484.05}
+[2026-05-25T13:35:19.773480820Z INFO  yellowstone_latency] {"ts_ms":1779716119773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":18231000,"p50":1000,"p90":5000,"p99":10000,"max":19095,"mean":1468.96}
+[2026-05-25T13:35:19.773508240Z INFO  yellowstone_latency] {"ts_ms":1779716119773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":6354,"p50":1,"p90":1,"p99":10,"max":660,"mean":1.63}
+[2026-05-25T13:35:19.773513010Z INFO  yellowstone_latency] {"ts_ms":1779716119773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":24256,"p50":5,"p90":10,"p99":10,"max":118,"mean":3.85}
+[2026-05-25T13:35:19.773517260Z INFO  yellowstone_latency] {"ts_ms":1779716119773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":18231000,"p50":1,"p90":1,"p99":1,"max":816,"mean":0.00}
+[2026-05-25T13:35:19.773521660Z INFO  yellowstone_latency] {"ts_ms":1779716119773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":606400,"p50":2704,"p90":2704,"p99":2704,"max":2704,"mean":2565.41}
+[2026-05-25T13:35:29.772672048Z INFO  yellowstone_latency] {"ts_ms":1779716129772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":17644500,"p50":1000,"p90":5000,"p99":19557,"max":19557,"mean":1772.45}
+[2026-05-25T13:35:29.772709018Z INFO  yellowstone_latency] {"ts_ms":1779716129772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":6126,"p50":1,"p90":1,"p99":10,"max":200,"mean":1.55}
+[2026-05-25T13:35:29.772715928Z INFO  yellowstone_latency] {"ts_ms":1779716129772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":23432,"p50":5,"p90":10,"p99":10,"max":533,"mean":3.79}
+[2026-05-25T13:35:29.772724898Z INFO  yellowstone_latency] {"ts_ms":1779716129772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":17644500,"p50":1,"p90":1,"p99":1,"max":1007,"mean":0.00}
+[2026-05-25T13:35:29.772731488Z INFO  yellowstone_latency] {"ts_ms":1779716129772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":585800,"p50":2921,"p90":2921,"p99":2921,"max":2921,"mean":2742.42}
+[2026-05-25T13:35:39.772899507Z INFO  yellowstone_latency] {"ts_ms":1779716139772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":14656000,"p50":2000,"p90":5000,"p99":20000,"max":22915,"mean":1648.24}
+[2026-05-25T13:35:39.772924967Z INFO  yellowstone_latency] {"ts_ms":1779716139772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5227,"p50":1,"p90":1,"p99":50,"max":207,"mean":1.65}
+[2026-05-25T13:35:39.772931157Z INFO  yellowstone_latency] {"ts_ms":1779716139772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19724,"p50":5,"p90":10,"p99":10,"max":117,"mean":3.84}
+[2026-05-25T13:35:39.772935347Z INFO  yellowstone_latency] {"ts_ms":1779716139772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":14656000,"p50":1,"p90":1,"p99":1,"max":1339,"mean":0.00}
+[2026-05-25T13:35:39.772939617Z INFO  yellowstone_latency] {"ts_ms":1779716139772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":493100,"p50":3149,"p90":3149,"p99":3149,"max":3149,"mean":2974.78}
+[2026-05-25T13:35:49.773540306Z INFO  yellowstone_latency] {"ts_ms":1779716149773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":15424200,"p50":2000,"p90":5000,"p99":16181,"max":16181,"mean":1561.31}
+[2026-05-25T13:35:49.773566016Z INFO  yellowstone_latency] {"ts_ms":1779716149773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5502,"p50":1,"p90":1,"p99":20,"max":184,"mean":1.50}
+[2026-05-25T13:35:49.773572266Z INFO  yellowstone_latency] {"ts_ms":1779716149773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":20768,"p50":5,"p90":10,"p99":10,"max":506,"mean":3.67}
+[2026-05-25T13:35:49.773577396Z INFO  yellowstone_latency] {"ts_ms":1779716149773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":15424200,"p50":1,"p90":1,"p99":1,"max":1065,"mean":0.00}
+[2026-05-25T13:35:49.773582756Z INFO  yellowstone_latency] {"ts_ms":1779716149773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":519200,"p50":3407,"p90":3407,"p99":3407,"max":3407,"mean":3223.04}
+[2026-05-25T13:35:59.773346775Z INFO  yellowstone_latency] {"ts_ms":1779716159773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":15551900,"p50":2000,"p90":5000,"p99":19357,"max":19357,"mean":1543.84}
+[2026-05-25T13:35:59.773374245Z INFO  yellowstone_latency] {"ts_ms":1779716159773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5526,"p50":1,"p90":1,"p99":20,"max":216,"mean":1.67}
+[2026-05-25T13:35:59.773379035Z INFO  yellowstone_latency] {"ts_ms":1779716159773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":20896,"p50":5,"p90":10,"p99":10,"max":495,"mean":3.78}
+[2026-05-25T13:35:59.773383155Z INFO  yellowstone_latency] {"ts_ms":1779716159773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":15551900,"p50":1,"p90":1,"p99":1,"max":576,"mean":0.00}
+[2026-05-25T13:35:59.773387375Z INFO  yellowstone_latency] {"ts_ms":1779716159773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":522400,"p50":3615,"p90":3615,"p99":3615,"max":3615,"mean":3431.57}
+[2026-05-25T13:36:09.772937296Z INFO  yellowstone_latency] {"ts_ms":1779716169772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":18371400,"p50":1000,"p90":5000,"p99":14734,"max":14734,"mean":1461.32}
+[2026-05-25T13:36:09.772965406Z INFO  yellowstone_latency] {"ts_ms":1779716169772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":6416,"p50":1,"p90":1,"p99":10,"max":210,"mean":1.65}
+[2026-05-25T13:36:09.772970626Z INFO  yellowstone_latency] {"ts_ms":1779716169772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":24464,"p50":5,"p90":10,"p99":10,"max":455,"mean":4.08}
+[2026-05-25T13:36:09.772974766Z INFO  yellowstone_latency] {"ts_ms":1779716169772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":18371400,"p50":1,"p90":1,"p99":1,"max":581,"mean":0.00}
+[2026-05-25T13:36:09.772978926Z INFO  yellowstone_latency] {"ts_ms":1779716169772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":611600,"p50":3810,"p90":3810,"p99":3810,"max":3810,"mean":3648.13}
+`;
+
+// ---- apples-to-apples optimized run at higher load (optimization branch; opt1 + opt2) ----
+const OPT200_LABEL = "Optimized (opt1 + opt2) · 200 subscribers";
+const OPT200_RAW = `
+[2026-05-25T13:46:09.773052836Z INFO  yellowstone_latency] {"ts_ms":1779716769773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5627,"p50":1,"p90":1,"p99":50,"max":383,"mean":1.18}
+[2026-05-25T13:46:09.773077296Z INFO  yellowstone_latency] {"ts_ms":1779716769773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":21292,"p50":1,"p90":1,"p99":10,"max":402,"mean":0.52}
+[2026-05-25T13:46:19.773604753Z INFO  yellowstone_latency] {"ts_ms":1779716779773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":2462576,"p50":2000,"p90":10000,"p99":18259,"max":18259,"mean":2607.50}
+[2026-05-25T13:46:19.773630193Z INFO  yellowstone_latency] {"ts_ms":1779716779773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5663,"p50":1,"p90":1,"p99":50,"max":133,"mean":1.17}
+[2026-05-25T13:46:19.773636753Z INFO  yellowstone_latency] {"ts_ms":1779716779773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":21364,"p50":1,"p90":2,"p99":20,"max":981,"mean":1.01}
+[2026-05-25T13:46:19.773642433Z INFO  yellowstone_latency] {"ts_ms":1779716779773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":2462576,"p50":1,"p90":1,"p99":1,"max":447,"mean":0.00}
+[2026-05-25T13:46:19.773648553Z INFO  yellowstone_latency] {"ts_ms":1779716779773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":83153,"p50":0,"p90":1,"p99":2,"max":4,"mean":0.17}
+[2026-05-25T13:46:29.773562009Z INFO  yellowstone_latency] {"ts_ms":1779716789773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":28765000,"p50":2000,"p90":10000,"p99":20000,"max":23622,"mean":2768.16}
+[2026-05-25T13:46:29.773585890Z INFO  yellowstone_latency] {"ts_ms":1779716789773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5140,"p50":1,"p90":1,"p99":20,"max":1049,"mean":1.87}
+[2026-05-25T13:46:29.773590880Z INFO  yellowstone_latency] {"ts_ms":1779716789773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19376,"p50":10,"p90":20,"p99":20,"max":221,"mean":6.48}
+[2026-05-25T13:46:29.773594930Z INFO  yellowstone_latency] {"ts_ms":1779716789773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":28765000,"p50":1,"p90":1,"p99":1,"max":3786,"mean":0.00}
+[2026-05-25T13:46:29.773599360Z INFO  yellowstone_latency] {"ts_ms":1779716789773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":968800,"p50":256,"p90":480,"p99":480,"max":480,"mean":239.58}
+[2026-05-25T13:46:39.773491496Z INFO  yellowstone_latency] {"ts_ms":1779716799773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":27576000,"p50":5000,"p90":10000,"p99":20000,"max":34301,"mean":3145.58}
+[2026-05-25T13:46:39.773526626Z INFO  yellowstone_latency] {"ts_ms":1779716799773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4948,"p50":1,"p90":1,"p99":20,"max":424,"mean":1.80}
+[2026-05-25T13:46:39.773533096Z INFO  yellowstone_latency] {"ts_ms":1779716799773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18616,"p50":10,"p90":20,"p99":20,"max":331,"mean":5.99}
+[2026-05-25T13:46:39.773538906Z INFO  yellowstone_latency] {"ts_ms":1779716799773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":27576000,"p50":1,"p90":1,"p99":1,"max":4006,"mean":0.00}
+[2026-05-25T13:46:39.773546676Z INFO  yellowstone_latency] {"ts_ms":1779716799773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":930800,"p50":858,"p90":858,"p99":858,"max":858,"mean":656.41}
+[2026-05-25T13:46:49.773270862Z INFO  yellowstone_latency] {"ts_ms":1779716809773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":29257800,"p50":2000,"p90":10000,"p99":20000,"max":29142,"mean":3073.94}
+[2026-05-25T13:46:49.773297993Z INFO  yellowstone_latency] {"ts_ms":1779716809773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5233,"p50":1,"p90":1,"p99":50,"max":259,"mean":1.65}
+[2026-05-25T13:46:49.773302693Z INFO  yellowstone_latency] {"ts_ms":1779716809773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19684,"p50":10,"p90":20,"p99":20,"max":526,"mean":6.12}
+[2026-05-25T13:46:49.773306673Z INFO  yellowstone_latency] {"ts_ms":1779716809773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":29257800,"p50":1,"p90":1,"p99":1,"max":5660,"mean":0.00}
+[2026-05-25T13:46:49.773311613Z INFO  yellowstone_latency] {"ts_ms":1779716809773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":984200,"p50":1024,"p90":1255,"p99":1255,"max":1255,"mean":1012.76}
+[2026-05-25T13:46:59.774164410Z INFO  yellowstone_latency] {"ts_ms":1779716819774,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":29531025,"p50":5000,"p90":10000,"p99":50000,"max":52257,"mean":3856.78}
+[2026-05-25T13:46:59.774194740Z INFO  yellowstone_latency] {"ts_ms":1779716819774,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5271,"p50":1,"p90":1,"p99":20,"max":182,"mean":1.55}
+[2026-05-25T13:46:59.774214440Z INFO  yellowstone_latency] {"ts_ms":1779716819774,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19884,"p50":5,"p90":20,"p99":20,"max":187,"mean":5.64}
+[2026-05-25T13:46:59.774222810Z INFO  yellowstone_latency] {"ts_ms":1779716819774,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":29531578,"p50":1,"p90":1,"p99":1,"max":4832,"mean":0.00}
+[2026-05-25T13:46:59.774229590Z INFO  yellowstone_latency] {"ts_ms":1779716819774,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":993941,"p50":1708,"p90":1708,"p99":1708,"max":1708,"mean":1432.55}
+[2026-05-25T13:47:09.773406466Z INFO  yellowstone_latency] {"ts_ms":1779716829773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":29285975,"p50":5000,"p90":10000,"p99":50000,"max":58357,"mean":3667.38}
+[2026-05-25T13:47:09.773429556Z INFO  yellowstone_latency] {"ts_ms":1779716829773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5262,"p50":1,"p90":1,"p99":20,"max":278,"mean":1.63}
+[2026-05-25T13:47:09.773434706Z INFO  yellowstone_latency] {"ts_ms":1779716829773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19760,"p50":5,"p90":20,"p99":20,"max":2289,"mean":5.72}
+[2026-05-25T13:47:09.773439226Z INFO  yellowstone_latency] {"ts_ms":1779716829773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":29285422,"p50":1,"p90":1,"p99":1,"max":3488,"mean":0.00}
+[2026-05-25T13:47:09.773444086Z INFO  yellowstone_latency] {"ts_ms":1779716829773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":988259,"p50":2070,"p90":2070,"p99":2070,"max":2070,"mean":1836.24}
+[2026-05-25T13:47:19.773439512Z INFO  yellowstone_latency] {"ts_ms":1779716839773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":30021400,"p50":5000,"p90":10000,"p99":36525,"max":36525,"mean":3801.54}
+[2026-05-25T13:47:19.773464392Z INFO  yellowstone_latency] {"ts_ms":1779716839773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5344,"p50":1,"p90":1,"p99":20,"max":184,"mean":1.56}
+[2026-05-25T13:47:19.773469172Z INFO  yellowstone_latency] {"ts_ms":1779716839773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":20168,"p50":5,"p90":20,"p99":20,"max":278,"mean":5.50}
+[2026-05-25T13:47:19.773473072Z INFO  yellowstone_latency] {"ts_ms":1779716839773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":30021400,"p50":1,"p90":1,"p99":1,"max":6026,"mean":0.00}
+[2026-05-25T13:47:19.773477542Z INFO  yellowstone_latency] {"ts_ms":1779716839773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1008400,"p50":2398,"p90":2398,"p99":2398,"max":2398,"mean":2161.00}
+[2026-05-25T13:47:29.772949079Z INFO  yellowstone_latency] {"ts_ms":1779716849772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":27054386,"p50":5000,"p90":10000,"p99":20000,"max":33000,"mean":3751.89}
+[2026-05-25T13:47:29.772982949Z INFO  yellowstone_latency] {"ts_ms":1779716849772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4885,"p50":1,"p90":1,"p99":50,"max":213,"mean":1.76}
+[2026-05-25T13:47:29.772989389Z INFO  yellowstone_latency] {"ts_ms":1779716849772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18296,"p50":5,"p90":20,"p99":20,"max":651,"mean":5.42}
+[2026-05-25T13:47:29.772996259Z INFO  yellowstone_latency] {"ts_ms":1779716849772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":27054845,"p50":1,"p90":1,"p99":1,"max":2943,"mean":0.00}
+[2026-05-25T13:47:29.773003299Z INFO  yellowstone_latency] {"ts_ms":1779716849773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":914756,"p50":2690,"p90":2690,"p99":2690,"max":2690,"mean":2446.57}
+[2026-05-25T13:47:39.772657685Z INFO  yellowstone_latency] {"ts_ms":1779716859772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":30425214,"p50":5000,"p90":10000,"p99":39251,"max":39251,"mean":4078.36}
+[2026-05-25T13:47:39.772679875Z INFO  yellowstone_latency] {"ts_ms":1779716859772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5387,"p50":1,"p90":1,"p99":10,"max":205,"mean":1.62}
+[2026-05-25T13:47:39.772699265Z INFO  yellowstone_latency] {"ts_ms":1779716859772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":20392,"p50":5,"p90":20,"p99":20,"max":231,"mean":5.59}
+[2026-05-25T13:47:39.772703975Z INFO  yellowstone_latency] {"ts_ms":1779716859772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":30424755,"p50":1,"p90":1,"p99":1,"max":3009,"mean":0.00}
+[2026-05-25T13:47:39.772708575Z INFO  yellowstone_latency] {"ts_ms":1779716859772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1019644,"p50":3007,"p90":3007,"p99":3007,"max":3007,"mean":2733.47}
+[2026-05-25T13:47:49.772931902Z INFO  yellowstone_latency] {"ts_ms":1779716869772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":30113000,"p50":5000,"p90":10000,"p99":20000,"max":41202,"mean":3648.07}
+[2026-05-25T13:47:49.772972112Z INFO  yellowstone_latency] {"ts_ms":1779716869772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5360,"p50":1,"p90":1,"p99":20,"max":769,"mean":1.85}
+[2026-05-25T13:47:49.772977242Z INFO  yellowstone_latency] {"ts_ms":1779716869772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":20248,"p50":5,"p90":20,"p99":20,"max":1009,"mean":5.26}
+[2026-05-25T13:47:49.772982092Z INFO  yellowstone_latency] {"ts_ms":1779716869772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":30113000,"p50":1,"p90":1,"p99":1,"max":4007,"mean":0.00}
+[2026-05-25T13:47:49.772986472Z INFO  yellowstone_latency] {"ts_ms":1779716869772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1012400,"p50":3339,"p90":3339,"p99":3339,"max":3339,"mean":3058.66}
+[2026-05-25T13:47:59.773404969Z INFO  yellowstone_latency] {"ts_ms":1779716879773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":27925200,"p50":2000,"p90":10000,"p99":20000,"max":43350,"mean":3289.79}
+[2026-05-25T13:47:59.773429649Z INFO  yellowstone_latency] {"ts_ms":1779716879773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4922,"p50":1,"p90":1,"p99":10,"max":195,"mean":1.64}
+[2026-05-25T13:47:59.773434589Z INFO  yellowstone_latency] {"ts_ms":1779716879773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18720,"p50":10,"p90":20,"p99":20,"max":129,"mean":5.93}
+[2026-05-25T13:47:59.773438529Z INFO  yellowstone_latency] {"ts_ms":1779716879773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":27925200,"p50":1,"p90":1,"p99":1,"max":3009,"mean":0.00}
+[2026-05-25T13:47:59.773443809Z INFO  yellowstone_latency] {"ts_ms":1779716879773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":936000,"p50":3918,"p90":3918,"p99":3918,"max":3918,"mean":3495.81}
+[2026-05-25T13:48:09.772654975Z INFO  yellowstone_latency] {"ts_ms":1779716889772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":27564616,"p50":5000,"p90":10000,"p99":20000,"max":32609,"mean":3502.17}
+[2026-05-25T13:48:09.772681385Z INFO  yellowstone_latency] {"ts_ms":1779716889772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4944,"p50":1,"p90":1,"p99":50,"max":584,"mean":1.97}
+[2026-05-25T13:48:09.772687625Z INFO  yellowstone_latency] {"ts_ms":1779716889772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18584,"p50":5,"p90":20,"p99":20,"max":5350,"mean":5.50}
+[2026-05-25T13:48:09.772693395Z INFO  yellowstone_latency] {"ts_ms":1779716889772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":27564929,"p50":1,"p90":1,"p99":1,"max":3750,"mean":0.00}
+[2026-05-25T13:48:09.772699705Z INFO  yellowstone_latency] {"ts_ms":1779716889772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":929017,"p50":4096,"p90":4340,"p99":4340,"max":4340,"mean":3984.13}
+[2026-05-25T13:48:19.772867782Z INFO  yellowstone_latency] {"ts_ms":1779716899772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":27732784,"p50":5000,"p90":10000,"p99":20000,"max":32784,"mean":3652.24}
+[2026-05-25T13:48:19.772891352Z INFO  yellowstone_latency] {"ts_ms":1779716899772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4976,"p50":1,"p90":1,"p99":50,"max":234,"mean":1.67}
+[2026-05-25T13:48:19.772909432Z INFO  yellowstone_latency] {"ts_ms":1779716899772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18696,"p50":5,"p90":20,"p99":20,"max":3204,"mean":6.11}
+[2026-05-25T13:48:19.772921732Z INFO  yellowstone_latency] {"ts_ms":1779716899772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":27732471,"p50":1,"p90":1,"p99":1,"max":4007,"mean":0.00}
+[2026-05-25T13:48:19.772932062Z INFO  yellowstone_latency] {"ts_ms":1779716899772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":934983,"p50":4730,"p90":4730,"p99":4730,"max":4730,"mean":4386.94}
+`;
+
+// ---- apples-to-apples optimized run at 400 subscribers (optimization branch; opt1 + opt2) ----
+const OPT400_LABEL = "Optimized (opt1 + opt2) · 400 subscribers";
+const OPT400_RAW = `
+[2026-05-25T13:49:29.772862198Z INFO  yellowstone_latency] {"ts_ms":1779716969772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5024,"p50":1,"p90":1,"p99":50,"max":295,"mean":1.26}
+[2026-05-25T13:49:29.772886048Z INFO  yellowstone_latency] {"ts_ms":1779716969772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18896,"p50":1,"p90":1,"p99":10,"max":111,"mean":0.44}
+[2026-05-25T13:49:39.772629764Z INFO  yellowstone_latency] {"ts_ms":1779716979772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":4130215,"p50":5000,"p90":20000,"p99":33662,"max":33662,"mean":6441.30}
+[2026-05-25T13:49:39.772765664Z INFO  yellowstone_latency] {"ts_ms":1779716979772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4786,"p50":1,"p90":1,"p99":50,"max":175,"mean":1.32}
+[2026-05-25T13:49:39.772813154Z INFO  yellowstone_latency] {"ts_ms":1779716979772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":17896,"p50":1,"p90":2,"p99":50,"max":578,"mean":1.24}
+[2026-05-25T13:49:39.772866894Z INFO  yellowstone_latency] {"ts_ms":1779716979772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":4132800,"p50":1,"p90":1,"p99":1,"max":3995,"mean":0.01}
+[2026-05-25T13:49:39.772912404Z INFO  yellowstone_latency] {"ts_ms":1779716979772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":144614,"p50":0,"p90":1,"p99":6,"max":6,"mean":0.35}
+[2026-05-25T13:49:49.773309131Z INFO  yellowstone_latency] {"ts_ms":1779716989773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":50376800,"p50":10000,"p90":20000,"p99":50000,"max":64365,"mean":7855.80}
+[2026-05-25T13:49:49.773339271Z INFO  yellowstone_latency] {"ts_ms":1779716989773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4564,"p50":1,"p90":1,"p99":50,"max":241,"mean":1.66}
+[2026-05-25T13:49:49.773345851Z INFO  yellowstone_latency] {"ts_ms":1779716989773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":17112,"p50":1,"p90":50,"p99":50,"max":420,"mean":8.74}
+[2026-05-25T13:49:49.773379561Z INFO  yellowstone_latency] {"ts_ms":1779716989773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":50375033,"p50":1,"p90":1,"p99":1,"max":5139,"mean":0.01}
+[2026-05-25T13:49:49.773385641Z INFO  yellowstone_latency] {"ts_ms":1779716989773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1710063,"p50":256,"p90":344,"p99":344,"max":344,"mean":150.39}
+[2026-05-25T13:49:59.773002178Z INFO  yellowstone_latency] {"ts_ms":1779716999772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":55858470,"p50":10000,"p90":50000,"p99":100000,"max":135271,"mean":11293.66}
+[2026-05-25T13:49:59.773035918Z INFO  yellowstone_latency] {"ts_ms":1779716999773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4993,"p50":1,"p90":1,"p99":50,"max":1630,"mean":1.90}
+[2026-05-25T13:49:59.773041988Z INFO  yellowstone_latency] {"ts_ms":1779716999773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18772,"p50":1,"p90":50,"p99":50,"max":3756,"mean":8.04}
+[2026-05-25T13:49:59.773047308Z INFO  yellowstone_latency] {"ts_ms":1779716999773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":55857652,"p50":1,"p90":1,"p99":1,"max":7007,"mean":0.01}
+[2026-05-25T13:49:59.773053588Z INFO  yellowstone_latency] {"ts_ms":1779716999773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1878410,"p50":512,"p90":653,"p99":653,"max":653,"mean":496.98}
+[2026-05-25T13:50:09.773350355Z INFO  yellowstone_latency] {"ts_ms":1779717009773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":57814800,"p50":10000,"p90":50000,"p99":100000,"max":117945,"mean":10583.19}
+[2026-05-25T13:50:09.773384085Z INFO  yellowstone_latency] {"ts_ms":1779717009773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5151,"p50":1,"p90":1,"p99":50,"max":424,"mean":1.85}
+[2026-05-25T13:50:09.773391395Z INFO  yellowstone_latency] {"ts_ms":1779717009773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19392,"p50":1,"p90":50,"p99":50,"max":1389,"mean":8.00}
+[2026-05-25T13:50:09.773397425Z INFO  yellowstone_latency] {"ts_ms":1779717009773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":57814800,"p50":1,"p90":1,"p99":1,"max":6280,"mean":0.01}
+[2026-05-25T13:50:09.773403945Z INFO  yellowstone_latency] {"ts_ms":1779717009773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1939200,"p50":992,"p90":992,"p99":992,"max":992,"mean":793.67}
+[2026-05-25T13:50:19.772912951Z INFO  yellowstone_latency] {"ts_ms":1779717019772,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":56237600,"p50":10000,"p90":20000,"p99":50000,"max":91407,"mean":8757.07}
+[2026-05-25T13:50:19.772947961Z INFO  yellowstone_latency] {"ts_ms":1779717019772,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5016,"p50":1,"p90":1,"p99":50,"max":733,"mean":1.79}
+[2026-05-25T13:50:19.772953221Z INFO  yellowstone_latency] {"ts_ms":1779717019772,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18900,"p50":1,"p90":50,"p99":50,"max":1620,"mean":8.53}
+[2026-05-25T13:50:19.772957751Z INFO  yellowstone_latency] {"ts_ms":1779717019772,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":56237600,"p50":1,"p90":1,"p99":1,"max":7557,"mean":0.01}
+[2026-05-25T13:50:19.772962081Z INFO  yellowstone_latency] {"ts_ms":1779717019772,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1890000,"p50":1307,"p90":1307,"p99":1307,"max":1307,"mean":1139.14}
+[2026-05-25T13:50:29.773481558Z INFO  yellowstone_latency] {"ts_ms":1779717029773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":59734620,"p50":10000,"p90":50000,"p99":100000,"max":130173,"mean":9058.33}
+[2026-05-25T13:50:29.773523528Z INFO  yellowstone_latency] {"ts_ms":1779717029773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5290,"p50":1,"p90":1,"p99":20,"max":330,"mean":1.68}
+[2026-05-25T13:50:29.773534178Z INFO  yellowstone_latency] {"ts_ms":1779717029773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19972,"p50":1,"p90":50,"p99":50,"max":653,"mean":8.23}
+[2026-05-25T13:50:29.773541378Z INFO  yellowstone_latency] {"ts_ms":1779717029773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":59735287,"p50":1,"p90":1,"p99":1,"max":6693,"mean":0.01}
+[2026-05-25T13:50:29.773548508Z INFO  yellowstone_latency] {"ts_ms":1779717029773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1997003,"p50":1570,"p90":1570,"p99":1570,"max":1570,"mean":1405.32}
+[2026-05-25T13:50:39.773509945Z INFO  yellowstone_latency] {"ts_ms":1779717039773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":60837380,"p50":5000,"p90":20000,"p99":50000,"max":67648,"mean":7413.55}
+[2026-05-25T13:50:39.773539595Z INFO  yellowstone_latency] {"ts_ms":1779717039773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5368,"p50":1,"p90":1,"p99":10,"max":323,"mean":1.55}
+[2026-05-25T13:50:39.773544445Z INFO  yellowstone_latency] {"ts_ms":1779717039773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":20348,"p50":5,"p90":50,"p99":50,"max":1095,"mean":10.08}
+[2026-05-25T13:50:39.773549595Z INFO  yellowstone_latency] {"ts_ms":1779717039773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":60836713,"p50":1,"p90":1,"p99":1,"max":6065,"mean":0.01}
+[2026-05-25T13:50:39.773555655Z INFO  yellowstone_latency] {"ts_ms":1779717039773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2034997,"p50":1746,"p90":1746,"p99":1746,"max":1746,"mean":1610.91}
+[2026-05-25T13:50:49.776897914Z INFO  yellowstone_latency] {"ts_ms":1779717049776,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":55541469,"p50":5000,"p90":20000,"p99":50000,"max":53798,"mean":6951.29}
+[2026-05-25T13:50:49.776933794Z INFO  yellowstone_latency] {"ts_ms":1779717049776,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4982,"p50":1,"p90":1,"p99":50,"max":212,"mean":1.73}
+[2026-05-25T13:50:49.776942434Z INFO  yellowstone_latency] {"ts_ms":1779717049776,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18704,"p50":5,"p90":50,"p99":50,"max":4311,"mean":10.51}
+[2026-05-25T13:50:49.776950314Z INFO  yellowstone_latency] {"ts_ms":1779717049776,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":55542053,"p50":1,"p90":1,"p99":1,"max":4048,"mean":0.01}
+[2026-05-25T13:50:49.776960084Z INFO  yellowstone_latency] {"ts_ms":1779717049776,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1867792,"p50":1919,"p90":1919,"p99":1919,"max":1919,"mean":1783.17}
+[2026-05-25T13:50:59.774680049Z INFO  yellowstone_latency] {"ts_ms":1779717059774,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":53959591,"p50":5000,"p90":20000,"p99":50000,"max":84448,"mean":7392.02}
+[2026-05-25T13:50:59.774707939Z INFO  yellowstone_latency] {"ts_ms":1779717059774,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4847,"p50":1,"p90":1,"p99":50,"max":634,"mean":1.71}
+[2026-05-25T13:50:59.774714209Z INFO  yellowstone_latency] {"ts_ms":1779717059774,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18180,"p50":2,"p90":50,"p99":50,"max":4723,"mean":9.41}
+[2026-05-25T13:50:59.774720779Z INFO  yellowstone_latency] {"ts_ms":1779717059774,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":53959526,"p50":1,"p90":1,"p99":1,"max":7758,"mean":0.01}
+[2026-05-25T13:50:59.774727019Z INFO  yellowstone_latency] {"ts_ms":1779717059774,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1819997,"p50":2075,"p90":2075,"p99":2075,"max":2075,"mean":1933.50}
+[2026-05-25T13:51:09.773081304Z INFO  yellowstone_latency] {"ts_ms":1779717069773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":59239821,"p50":5000,"p90":20000,"p99":50000,"max":77788,"mean":7241.51}
+[2026-05-25T13:51:09.773113464Z INFO  yellowstone_latency] {"ts_ms":1779717069773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5258,"p50":1,"p90":1,"p99":50,"max":273,"mean":1.69}
+[2026-05-25T13:51:09.773119854Z INFO  yellowstone_latency] {"ts_ms":1779717069773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19829,"p50":5,"p90":50,"p99":50,"max":7020,"mean":9.95}
+[2026-05-25T13:51:09.773146464Z INFO  yellowstone_latency] {"ts_ms":1779717069773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":59240007,"p50":1,"p90":1,"p99":1,"max":4011,"mean":0.01}
+[2026-05-25T13:51:09.773153884Z INFO  yellowstone_latency] {"ts_ms":1779717069773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1983201,"p50":2256,"p90":2256,"p99":2256,"max":2256,"mean":2095.75}
+[2026-05-25T13:51:19.773226391Z INFO  yellowstone_latency] {"ts_ms":1779717079773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":59395919,"p50":5000,"p90":20000,"p99":50000,"max":87955,"mean":6790.73}
+[2026-05-25T13:51:19.773254911Z INFO  yellowstone_latency] {"ts_ms":1779717079773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5267,"p50":1,"p90":1,"p99":50,"max":929,"mean":2.01}
+[2026-05-25T13:51:19.773259741Z INFO  yellowstone_latency] {"ts_ms":1779717079773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":19879,"p50":5,"p90":50,"p99":50,"max":1063,"mean":10.24}
+[2026-05-25T13:51:19.773264121Z INFO  yellowstone_latency] {"ts_ms":1779717079773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":59395214,"p50":1,"p90":1,"p99":1,"max":7005,"mean":0.01}
+[2026-05-25T13:51:19.773268501Z INFO  yellowstone_latency] {"ts_ms":1779717079773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1988210,"p50":2477,"p90":2477,"p99":2477,"max":2477,"mean":2271.94}
+[2026-05-25T13:51:29.773144127Z INFO  yellowstone_latency] {"ts_ms":1779717089773,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":52526000,"p50":10000,"p90":50000,"p99":50000,"max":70912,"mean":8815.19}
+[2026-05-25T13:51:29.773173507Z INFO  yellowstone_latency] {"ts_ms":1779717089773,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4735,"p50":1,"p90":1,"p99":50,"max":160,"mean":1.57}
+[2026-05-25T13:51:29.773178287Z INFO  yellowstone_latency] {"ts_ms":1779717089773,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":17748,"p50":1,"p90":50,"p99":50,"max":807,"mean":8.90}
+[2026-05-25T13:51:29.773182657Z INFO  yellowstone_latency] {"ts_ms":1779717089773,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":52526000,"p50":1,"p90":1,"p99":1,"max":8007,"mean":0.01}
+[2026-05-25T13:51:29.773187367Z INFO  yellowstone_latency] {"ts_ms":1779717089773,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1774800,"p50":2827,"p90":2827,"p99":2827,"max":2827,"mean":2551.47}
+[2026-05-25T13:51:39.775618296Z INFO  yellowstone_latency] {"ts_ms":1779717099775,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":63857218,"p50":10000,"p90":50000,"p99":50000,"max":74148,"mean":9540.20}
+[2026-05-25T13:51:39.775784376Z INFO  yellowstone_latency] {"ts_ms":1779717099775,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5639,"p50":1,"p90":1,"p99":20,"max":568,"mean":1.62}
+[2026-05-25T13:51:39.775853206Z INFO  yellowstone_latency] {"ts_ms":1779717099775,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":21342,"p50":1,"p90":50,"p99":50,"max":1190,"mean":8.33}
+[2026-05-25T13:51:39.775863716Z INFO  yellowstone_latency] {"ts_ms":1779717099775,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":63859971,"p50":1,"p90":1,"p99":1,"max":9287,"mean":0.01}
+[2026-05-25T13:51:39.775870736Z INFO  yellowstone_latency] {"ts_ms":1779717099775,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2131634,"p50":3174,"p90":3174,"p99":3174,"max":3174,"mean":2941.33}
+`;
+
+// ---- apples-to-apples unoptimized run at 200 subscribers (unop-metrics branch) ----
+const UNOPT200_LABEL = "Unoptimized · 200 subscribers";
+const UNOPT200_RAW = `
+[2026-05-25T13:59:06.551887233Z INFO  yellowstone_latency] {"ts_ms":1779717546551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4573,"p50":1,"p90":5,"p99":50,"max":541,"mean":2.37}
+[2026-05-25T13:59:06.551931553Z INFO  yellowstone_latency] {"ts_ms":1779717546551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4285,"p50":1,"p90":5,"p99":10,"max":541,"mean":1.80}
+[2026-05-25T13:59:16.551370639Z INFO  yellowstone_latency] {"ts_ms":1779717556551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4451,"p50":1,"p90":5,"p99":50,"max":203,"mean":2.27}
+[2026-05-25T13:59:16.551400089Z INFO  yellowstone_latency] {"ts_ms":1779717556551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4137,"p50":1,"p90":5,"p99":20,"max":203,"mean":1.71}
+[2026-05-25T13:59:26.552232526Z INFO  yellowstone_latency] {"ts_ms":1779717566552,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4796,"p50":1,"p90":5,"p99":50,"max":224,"mean":2.73}
+[2026-05-25T13:59:26.552255226Z INFO  yellowstone_latency] {"ts_ms":1779717566552,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4484,"p50":1,"p90":5,"p99":20,"max":224,"mean":2.14}
+[2026-05-25T13:59:36.551588732Z INFO  yellowstone_latency] {"ts_ms":1779717576551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7852921,"p50":5000,"p90":10000,"p99":20000,"max":22036,"mean":3074.30}
+[2026-05-25T13:59:36.551628412Z INFO  yellowstone_latency] {"ts_ms":1779717576551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4853,"p50":2,"p90":50,"p99":100,"max":302,"mean":8.17}
+[2026-05-25T13:59:36.551634862Z INFO  yellowstone_latency] {"ts_ms":1779717576551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4553,"p50":2,"p90":50,"p99":100,"max":302,"mean":8.19}
+[2026-05-25T13:59:36.551641102Z INFO  yellowstone_latency] {"ts_ms":1779717576551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7853537,"p50":1,"p90":1,"p99":1,"max":1155,"mean":0.00}
+[2026-05-25T13:59:36.551661842Z INFO  yellowstone_latency] {"ts_ms":1779717576551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":281438,"p50":0,"p90":0,"p99":1,"max":2,"mean":0.03}
+[2026-05-25T13:59:46.551619559Z INFO  yellowstone_latency] {"ts_ms":1779717586551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":24607241,"p50":5000,"p90":10000,"p99":20000,"max":21428,"mean":2923.88}
+[2026-05-25T13:59:46.551649069Z INFO  yellowstone_latency] {"ts_ms":1779717586551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4499,"p50":20,"p90":100,"p99":100,"max":508,"mean":23.59}
+[2026-05-25T13:59:46.551654049Z INFO  yellowstone_latency] {"ts_ms":1779717586551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4185,"p50":20,"p90":100,"p99":100,"max":508,"mean":25.11}
+[2026-05-25T13:59:46.551658949Z INFO  yellowstone_latency] {"ts_ms":1779717586551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":24607036,"p50":1,"p90":1,"p99":1,"max":4006,"mean":0.00}
+[2026-05-25T13:59:46.551663439Z INFO  yellowstone_latency] {"ts_ms":1779717586551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":900325,"p50":0,"p90":0,"p99":4,"max":6,"mean":0.08}
+[2026-05-25T13:59:56.551478155Z INFO  yellowstone_latency] {"ts_ms":1779717596551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":22923260,"p50":2000,"p90":10000,"p99":19313,"max":19313,"mean":2610.57}
+[2026-05-25T13:59:56.551516885Z INFO  yellowstone_latency] {"ts_ms":1779717596551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4171,"p50":20,"p90":100,"p99":100,"max":452,"mean":25.59}
+[2026-05-25T13:59:56.551524165Z INFO  yellowstone_latency] {"ts_ms":1779717596551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":3897,"p50":50,"p90":100,"p99":100,"max":254,"mean":27.05}
+[2026-05-25T13:59:56.551530645Z INFO  yellowstone_latency] {"ts_ms":1779717596551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":22923307,"p50":1,"p90":1,"p99":1,"max":1793,"mean":0.00}
+[2026-05-25T13:59:56.551536675Z INFO  yellowstone_latency] {"ts_ms":1779717596551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":834068,"p50":8,"p90":64,"p99":70,"max":70,"mean":13.64}
+[2026-05-25T14:00:06.551348752Z INFO  yellowstone_latency] {"ts_ms":1779717606551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":23530177,"p50":5000,"p90":10000,"p99":20000,"max":25332,"mean":3268.00}
+[2026-05-25T14:00:06.551382782Z INFO  yellowstone_latency] {"ts_ms":1779717606551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4318,"p50":20,"p90":100,"p99":100,"max":283,"mean":22.92}
+[2026-05-25T14:00:06.551387802Z INFO  yellowstone_latency] {"ts_ms":1779717606551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4006,"p50":20,"p90":100,"p99":100,"max":279,"mean":24.42}
+[2026-05-25T14:00:06.551391892Z INFO  yellowstone_latency] {"ts_ms":1779717606551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":23529719,"p50":1,"p90":1,"p99":1,"max":4010,"mean":0.00}
+[2026-05-25T14:00:06.551396332Z INFO  yellowstone_latency] {"ts_ms":1779717606551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":863772,"p50":64,"p90":128,"p99":128,"max":131,"mean":57.25}
+[2026-05-25T14:00:16.551862354Z INFO  yellowstone_latency] {"ts_ms":1779717616551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":25197121,"p50":5000,"p90":10000,"p99":20000,"max":29310,"mean":3310.60}
+[2026-05-25T14:00:16.551906214Z INFO  yellowstone_latency] {"ts_ms":1779717616551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4571,"p50":10,"p90":100,"p99":100,"max":1499,"mean":21.40}
+[2026-05-25T14:00:16.551913284Z INFO  yellowstone_latency] {"ts_ms":1779717616551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4271,"p50":20,"p90":100,"p99":100,"max":1499,"mean":22.66}
+[2026-05-25T14:00:16.551932224Z INFO  yellowstone_latency] {"ts_ms":1779717616551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":25197507,"p50":1,"p90":1,"p99":1,"max":4011,"mean":0.00}
+[2026-05-25T14:00:16.551939544Z INFO  yellowstone_latency] {"ts_ms":1779717616551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":913883,"p50":128,"p90":206,"p99":206,"max":206,"mean":101.12}
+[2026-05-25T14:00:26.552048511Z INFO  yellowstone_latency] {"ts_ms":1779717626552,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":27271768,"p50":2000,"p90":10000,"p99":20000,"max":29855,"mean":2691.79}
+[2026-05-25T14:00:26.552087961Z INFO  yellowstone_latency] {"ts_ms":1779717626552,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4936,"p50":20,"p90":100,"p99":100,"max":678,"mean":24.88}
+[2026-05-25T14:00:26.552094671Z INFO  yellowstone_latency] {"ts_ms":1779717626552,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4612,"p50":50,"p90":100,"p99":100,"max":678,"mean":26.53}
+[2026-05-25T14:00:26.552100611Z INFO  yellowstone_latency] {"ts_ms":1779717626552,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":27271956,"p50":1,"p90":1,"p99":1,"max":2607,"mean":0.00}
+[2026-05-25T14:00:26.552124261Z INFO  yellowstone_latency] {"ts_ms":1779717626552,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":987104,"p50":256,"p90":256,"p99":280,"max":280,"mean":166.19}
+[2026-05-25T14:00:36.551500697Z INFO  yellowstone_latency] {"ts_ms":1779717636551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":27100311,"p50":5000,"p90":10000,"p99":20000,"max":27886,"mean":3156.34}
+[2026-05-25T14:00:36.551521297Z INFO  yellowstone_latency] {"ts_ms":1779717636551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4885,"p50":20,"p90":100,"p99":100,"max":996,"mean":24.54}
+[2026-05-25T14:00:36.551527198Z INFO  yellowstone_latency] {"ts_ms":1779717636551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4581,"p50":50,"p90":100,"p99":100,"max":996,"mean":25.92}
+[2026-05-25T14:00:36.551532778Z INFO  yellowstone_latency] {"ts_ms":1779717636551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":27099737,"p50":1,"p90":1,"p99":1,"max":4009,"mean":0.00}
+[2026-05-25T14:00:36.551538328Z INFO  yellowstone_latency] {"ts_ms":1779717636551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":977413,"p50":256,"p90":364,"p99":364,"max":364,"mean":224.67}
+[2026-05-25T14:00:46.551256654Z INFO  yellowstone_latency] {"ts_ms":1779717646551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":26350200,"p50":2000,"p90":10000,"p99":20000,"max":22883,"mean":2658.53}
+[2026-05-25T14:00:46.551285304Z INFO  yellowstone_latency] {"ts_ms":1779717646551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4789,"p50":20,"p90":100,"p99":100,"max":687,"mean":25.86}
+[2026-05-25T14:00:46.551290224Z INFO  yellowstone_latency] {"ts_ms":1779717646551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4471,"p50":50,"p90":100,"p99":100,"max":687,"mean":27.12}
+[2026-05-25T14:00:46.551294284Z INFO  yellowstone_latency] {"ts_ms":1779717646551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":26350200,"p50":1,"p90":1,"p99":1,"max":1021,"mean":0.00}
+[2026-05-25T14:00:46.551298804Z INFO  yellowstone_latency] {"ts_ms":1779717646551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":957800,"p50":512,"p90":512,"p99":587,"max":587,"mean":339.28}
+[2026-05-25T14:00:56.551621441Z INFO  yellowstone_latency] {"ts_ms":1779717656551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":28429400,"p50":2000,"p90":10000,"p99":20000,"max":30310,"mean":2807.13}
+[2026-05-25T14:00:56.551652421Z INFO  yellowstone_latency] {"ts_ms":1779717656551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5133,"p50":20,"p90":100,"p99":100,"max":402,"mean":23.58}
+[2026-05-25T14:00:56.551657631Z INFO  yellowstone_latency] {"ts_ms":1779717656551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4807,"p50":20,"p90":100,"p99":100,"max":402,"mean":24.89}
+[2026-05-25T14:00:56.551663461Z INFO  yellowstone_latency] {"ts_ms":1779717656551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":28429400,"p50":1,"p90":1,"p99":1,"max":3047,"mean":0.00}
+[2026-05-25T14:00:56.551669801Z INFO  yellowstone_latency] {"ts_ms":1779717656551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1026600,"p50":911,"p90":911,"p99":911,"max":911,"mean":619.98}
+[2026-05-25T14:01:06.551423338Z INFO  yellowstone_latency] {"ts_ms":1779717666551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":24046400,"p50":5000,"p90":10000,"p99":20000,"max":28144,"mean":3306.84}
+[2026-05-25T14:01:06.551453638Z INFO  yellowstone_latency] {"ts_ms":1779717666551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4396,"p50":20,"p90":100,"p99":100,"max":382,"mean":26.40}
+[2026-05-25T14:01:06.551460098Z INFO  yellowstone_latency] {"ts_ms":1779717666551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4096,"p50":50,"p90":100,"p99":100,"max":166,"mean":28.04}
+[2026-05-25T14:01:06.551465588Z INFO  yellowstone_latency] {"ts_ms":1779717666551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":24046400,"p50":1,"p90":1,"p99":1,"max":2511,"mean":0.01}
+[2026-05-25T14:01:06.551471488Z INFO  yellowstone_latency] {"ts_ms":1779717666551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":879200,"p50":1024,"p90":1024,"p99":1131,"max":1131,"mean":881.69}
+[2026-05-25T14:01:16.551336614Z INFO  yellowstone_latency] {"ts_ms":1779717676551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":26086800,"p50":5000,"p90":10000,"p99":20000,"max":26505,"mean":3668.45}
+[2026-05-25T14:01:16.551367385Z INFO  yellowstone_latency] {"ts_ms":1779717676551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4709,"p50":20,"p90":100,"p99":100,"max":302,"mean":22.68}
+[2026-05-25T14:01:16.551374845Z INFO  yellowstone_latency] {"ts_ms":1779717676551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4409,"p50":20,"p90":100,"p99":100,"max":302,"mean":24.09}
+[2026-05-25T14:01:16.551382005Z INFO  yellowstone_latency] {"ts_ms":1779717676551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":26086800,"p50":1,"p90":1,"p99":1,"max":4509,"mean":0.00}
+[2026-05-25T14:01:16.551388705Z INFO  yellowstone_latency] {"ts_ms":1779717676551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":941800,"p50":1432,"p90":1432,"p99":1432,"max":1432,"mean":1112.12}
+[2026-05-25T14:01:26.551723712Z INFO  yellowstone_latency] {"ts_ms":1779717686551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":25724292,"p50":5000,"p90":10000,"p99":20000,"max":22200,"mean":3193.03}
+[2026-05-25T14:01:26.551761452Z INFO  yellowstone_latency] {"ts_ms":1779717686551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4679,"p50":20,"p90":100,"p99":100,"max":575,"mean":23.20}
+[2026-05-25T14:01:26.551768122Z INFO  yellowstone_latency] {"ts_ms":1779717686551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4369,"p50":20,"p90":100,"p99":100,"max":575,"mean":24.65}
+[2026-05-25T14:01:26.551775602Z INFO  yellowstone_latency] {"ts_ms":1779717686551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":25724881,"p50":1,"p90":1,"p99":1,"max":4008,"mean":0.00}
+[2026-05-25T14:01:26.551782742Z INFO  yellowstone_latency] {"ts_ms":1779717686551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":935546,"p50":1722,"p90":1722,"p99":1722,"max":1722,"mean":1413.16}
+[2026-05-25T14:01:36.551298098Z INFO  yellowstone_latency] {"ts_ms":1779717696551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":24003308,"p50":5000,"p90":10000,"p99":20000,"max":23250,"mean":3200.11}
+[2026-05-25T14:01:36.551328748Z INFO  yellowstone_latency] {"ts_ms":1779717696551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4375,"p50":20,"p90":100,"p99":100,"max":428,"mean":23.48}
+[2026-05-25T14:01:36.551335808Z INFO  yellowstone_latency] {"ts_ms":1779717696551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4075,"p50":20,"p90":100,"p99":100,"max":428,"mean":25.09}
+[2026-05-25T14:01:36.551341798Z INFO  yellowstone_latency] {"ts_ms":1779717696551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":24002719,"p50":1,"p90":1,"p99":1,"max":2517,"mean":0.00}
+[2026-05-25T14:01:36.551348578Z INFO  yellowstone_latency] {"ts_ms":1779717696551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":875254,"p50":1934,"p90":1934,"p99":1934,"max":1934,"mean":1657.08}
+`;
+
+// ---- apples-to-apples unoptimized run at 400 subscribers (unop-metrics branch) ----
+const UNOPT400_LABEL = "Unoptimized · 400 subscribers";
+const UNOPT400_RAW = `
+[2026-05-25T14:04:16.552167778Z INFO  yellowstone_latency] {"ts_ms":1779717856552,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":19447083,"p50":5000,"p90":20000,"p99":50000,"max":74054,"mean":6852.27}
+[2026-05-25T14:04:16.552203998Z INFO  yellowstone_latency] {"ts_ms":1779717856552,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5744,"p50":2,"p90":50,"p99":200,"max":632,"mean":13.33}
+[2026-05-25T14:04:16.552209748Z INFO  yellowstone_latency] {"ts_ms":1779717856552,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5438,"p50":2,"p90":50,"p99":200,"max":632,"mean":13.47}
+[2026-05-25T14:04:16.552214818Z INFO  yellowstone_latency] {"ts_ms":1779717856552,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":19447083,"p50":1,"p90":1,"p99":1,"max":4279,"mean":0.01}
+[2026-05-25T14:04:16.552220518Z INFO  yellowstone_latency] {"ts_ms":1779717856552,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":686748,"p50":0,"p90":0,"p99":2,"max":4,"mean":0.07}
+[2026-05-25T14:04:26.552123745Z INFO  yellowstone_latency] {"ts_ms":1779717866552,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":54042000,"p50":5000,"p90":20000,"p99":96021,"max":96021,"mean":8301.70}
+[2026-05-25T14:04:26.552152955Z INFO  yellowstone_latency] {"ts_ms":1779717866552,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4798,"p50":50,"p90":200,"p99":500,"max":1442,"mean":47.20}
+[2026-05-25T14:04:26.552158805Z INFO  yellowstone_latency] {"ts_ms":1779717866552,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4528,"p50":50,"p90":200,"p99":200,"max":1442,"mean":46.45}
+[2026-05-25T14:04:26.552162795Z INFO  yellowstone_latency] {"ts_ms":1779717866552,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":54042000,"p50":1,"p90":1,"p99":1,"max":5008,"mean":0.01}
+[2026-05-25T14:04:26.552167435Z INFO  yellowstone_latency] {"ts_ms":1779717866552,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1919200,"p50":8,"p90":64,"p99":64,"max":65,"mean":14.56}
+[2026-05-25T14:04:36.552209732Z INFO  yellowstone_latency] {"ts_ms":1779717876552,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":53001600,"p50":5000,"p90":20000,"p99":50000,"max":70822,"mean":6135.10}
+[2026-05-25T14:04:36.552240072Z INFO  yellowstone_latency] {"ts_ms":1779717876552,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4782,"p50":50,"p90":200,"p99":500,"max":2763,"mean":46.15}
+[2026-05-25T14:04:36.552246412Z INFO  yellowstone_latency] {"ts_ms":1779717876552,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4470,"p50":50,"p90":200,"p99":200,"max":2763,"mean":45.48}
+[2026-05-25T14:04:36.552252412Z INFO  yellowstone_latency] {"ts_ms":1779717876552,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":53001600,"p50":1,"p90":1,"p99":1,"max":6007,"mean":0.01}
+[2026-05-25T14:04:36.552259162Z INFO  yellowstone_latency] {"ts_ms":1779717876552,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1912800,"p50":128,"p90":160,"p99":160,"max":160,"mean":93.39}
+[2026-05-25T14:04:46.551659528Z INFO  yellowstone_latency] {"ts_ms":1779717886551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":54029955,"p50":10000,"p90":50000,"p99":100000,"max":102396,"mean":9984.83}
+[2026-05-25T14:04:46.551697498Z INFO  yellowstone_latency] {"ts_ms":1779717886551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4839,"p50":20,"p90":200,"p99":500,"max":4052,"mean":41.32}
+[2026-05-25T14:04:46.551704708Z INFO  yellowstone_latency] {"ts_ms":1779717886551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4539,"p50":20,"p90":200,"p99":200,"max":4052,"mean":40.60}
+[2026-05-25T14:04:46.551710728Z INFO  yellowstone_latency] {"ts_ms":1779717886551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":54030539,"p50":1,"p90":1,"p99":1,"max":8384,"mean":0.01}
+[2026-05-25T14:04:46.551717778Z INFO  yellowstone_latency] {"ts_ms":1779717886551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1935042,"p50":256,"p90":256,"p99":269,"max":269,"mean":189.25}
+[2026-05-25T14:04:56.552108465Z INFO  yellowstone_latency] {"ts_ms":1779717896552,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":61966845,"p50":10000,"p90":50000,"p99":100000,"max":103613,"mean":9882.13}
+[2026-05-25T14:04:56.552145885Z INFO  yellowstone_latency] {"ts_ms":1779717896552,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5481,"p50":20,"p90":200,"p99":200,"max":1001,"mean":35.33}
+[2026-05-25T14:04:56.552153315Z INFO  yellowstone_latency] {"ts_ms":1779717896552,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5175,"p50":20,"p90":200,"p99":200,"max":1001,"mean":35.50}
+[2026-05-25T14:04:56.552161755Z INFO  yellowstone_latency] {"ts_ms":1779717896552,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":61966261,"p50":1,"p90":1,"p99":1,"max":7006,"mean":0.01}
+[2026-05-25T14:04:56.552172455Z INFO  yellowstone_latency] {"ts_ms":1779717896552,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2192958,"p50":379,"p90":379,"p99":379,"max":379,"mean":287.73}
+[2026-05-25T14:05:06.552207832Z INFO  yellowstone_latency] {"ts_ms":1779717906552,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":58489892,"p50":5000,"p90":20000,"p99":50000,"max":85533,"mean":7181.86}
+[2026-05-25T14:05:06.552296632Z INFO  yellowstone_latency] {"ts_ms":1779717906552,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5194,"p50":20,"p90":200,"p99":200,"max":2087,"mean":42.45}
+[2026-05-25T14:05:06.552335082Z INFO  yellowstone_latency] {"ts_ms":1779717906552,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4900,"p50":50,"p90":200,"p99":200,"max":2087,"mean":42.83}
+[2026-05-25T14:05:06.552385052Z INFO  yellowstone_latency] {"ts_ms":1779717906552,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":58491887,"p50":1,"p90":1,"p99":1,"max":6470,"mean":0.01}
+[2026-05-25T14:05:06.552416122Z INFO  yellowstone_latency] {"ts_ms":1779717906552,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2077053,"p50":497,"p90":497,"p99":497,"max":497,"mean":396.77}
+[2026-05-25T14:05:16.551559778Z INFO  yellowstone_latency] {"ts_ms":1779717916551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":60759983,"p50":10000,"p90":50000,"p99":88221,"max":88221,"mean":9689.44}
+[2026-05-25T14:05:16.551598638Z INFO  yellowstone_latency] {"ts_ms":1779717916551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5373,"p50":20,"p90":200,"p99":200,"max":1636,"mean":36.77}
+[2026-05-25T14:05:16.551605188Z INFO  yellowstone_latency] {"ts_ms":1779717916551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5073,"p50":20,"p90":200,"p99":200,"max":1636,"mean":36.62}
+[2026-05-25T14:05:16.551611078Z INFO  yellowstone_latency] {"ts_ms":1779717916551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":60758561,"p50":1,"p90":1,"p99":1,"max":8008,"mean":0.01}
+[2026-05-25T14:05:16.551618388Z INFO  yellowstone_latency] {"ts_ms":1779717916551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2149538,"p50":512,"p90":596,"p99":596,"max":596,"mean":494.37}
+[2026-05-25T14:05:26.551613975Z INFO  yellowstone_latency] {"ts_ms":1779717926551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":61328925,"p50":10000,"p90":50000,"p99":197387,"max":197387,"mean":14709.55}
+[2026-05-25T14:05:26.551644565Z INFO  yellowstone_latency] {"ts_ms":1779717926551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5381,"p50":10,"p90":100,"p99":200,"max":5039,"mean":32.82}
+[2026-05-25T14:05:26.551651655Z INFO  yellowstone_latency] {"ts_ms":1779717926551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5093,"p50":10,"p90":100,"p99":200,"max":5039,"mean":33.02}
+[2026-05-25T14:05:26.551657805Z INFO  yellowstone_latency] {"ts_ms":1779717926551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":61328352,"p50":1,"p90":1,"p99":1,"max":6136,"mean":0.01}
+[2026-05-25T14:05:26.551664675Z INFO  yellowstone_latency] {"ts_ms":1779717926551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2152609,"p50":732,"p90":732,"p99":732,"max":732,"mean":603.08}
+[2026-05-25T14:05:36.551824892Z INFO  yellowstone_latency] {"ts_ms":1779717936551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":63034876,"p50":10000,"p90":50000,"p99":100000,"max":170449,"mean":9963.13}
+[2026-05-25T14:05:36.551865422Z INFO  yellowstone_latency] {"ts_ms":1779717936551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5550,"p50":20,"p90":200,"p99":200,"max":1426,"mean":36.46}
+[2026-05-25T14:05:36.551872432Z INFO  yellowstone_latency] {"ts_ms":1779717936551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5250,"p50":20,"p90":200,"p99":200,"max":1426,"mean":36.64}
+[2026-05-25T14:05:36.551878562Z INFO  yellowstone_latency] {"ts_ms":1779717936551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":63035389,"p50":1,"p90":1,"p99":1,"max":4127,"mean":0.01}
+[2026-05-25T14:05:36.551884902Z INFO  yellowstone_latency] {"ts_ms":1779717936551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2219686,"p50":887,"p90":887,"p99":887,"max":887,"mean":742.74}
+[2026-05-25T14:05:46.551475539Z INFO  yellowstone_latency] {"ts_ms":1779717946551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":61274724,"p50":10000,"p90":20000,"p99":50000,"max":92868,"mean":8575.95}
+[2026-05-25T14:05:46.551504399Z INFO  yellowstone_latency] {"ts_ms":1779717946551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5433,"p50":20,"p90":200,"p99":200,"max":1343,"mean":39.66}
+[2026-05-25T14:05:46.551509399Z INFO  yellowstone_latency] {"ts_ms":1779717946551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5121,"p50":20,"p90":200,"p99":200,"max":1343,"mean":39.62}
+[2026-05-25T14:05:46.551524659Z INFO  yellowstone_latency] {"ts_ms":1779717946551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":61274211,"p50":1,"p90":1,"p99":1,"max":5813,"mean":0.01}
+[2026-05-25T14:05:46.551529809Z INFO  yellowstone_latency] {"ts_ms":1779717946551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2173514,"p50":1024,"p90":1024,"p99":1036,"max":1036,"mean":876.90}
+[2026-05-25T14:05:56.551455245Z INFO  yellowstone_latency] {"ts_ms":1779717956551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":60114400,"p50":10000,"p90":50000,"p99":100000,"max":149543,"mean":10572.70}
+[2026-05-25T14:05:56.551480805Z INFO  yellowstone_latency] {"ts_ms":1779717956551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5316,"p50":20,"p90":200,"p99":200,"max":3249,"mean":37.60}
+[2026-05-25T14:05:56.551485905Z INFO  yellowstone_latency] {"ts_ms":1779717956551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5016,"p50":20,"p90":200,"p99":200,"max":3249,"mean":38.25}
+[2026-05-25T14:05:56.551490005Z INFO  yellowstone_latency] {"ts_ms":1779717956551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":60114400,"p50":1,"p90":1,"p99":1,"max":7006,"mean":0.01}
+[2026-05-25T14:05:56.551494465Z INFO  yellowstone_latency] {"ts_ms":1779717956551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2126400,"p50":1329,"p90":1329,"p99":1329,"max":1329,"mean":1096.97}
+[2026-05-25T14:06:06.551989483Z INFO  yellowstone_latency] {"ts_ms":1779717966551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":59948800,"p50":10000,"p90":50000,"p99":200000,"max":236942,"mean":12887.63}
+[2026-05-25T14:06:06.552012113Z INFO  yellowstone_latency] {"ts_ms":1779717966552,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5200,"p50":20,"p90":200,"p99":200,"max":1727,"mean":37.97}
+[2026-05-25T14:06:06.552017003Z INFO  yellowstone_latency] {"ts_ms":1779717966552,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":4960,"p50":20,"p90":200,"p99":200,"max":1727,"mean":38.70}
+[2026-05-25T14:06:06.552021163Z INFO  yellowstone_latency] {"ts_ms":1779717966552,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":59948800,"p50":1,"p90":1,"p99":1,"max":7006,"mean":0.01}
+[2026-05-25T14:06:06.552026013Z INFO  yellowstone_latency] {"ts_ms":1779717966552,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":2080000,"p50":1559,"p90":1559,"p99":1559,"max":1559,"mean":1360.94}
+[2026-05-25T14:06:16.551442779Z INFO  yellowstone_latency] {"ts_ms":1779717976551,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":43245249,"p50":10000,"p90":50000,"p99":100000,"max":178112,"mean":13018.50}
+[2026-05-25T14:06:16.551466919Z INFO  yellowstone_latency] {"ts_ms":1779717976551,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":5942,"p50":5,"p90":100,"p99":200,"max":1169,"mean":22.38}
+[2026-05-25T14:06:16.551471809Z INFO  yellowstone_latency] {"ts_ms":1779717976551,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":5635,"p50":5,"p90":100,"p99":200,"max":665,"mean":22.74}
+[2026-05-25T14:06:16.551484849Z INFO  yellowstone_latency] {"ts_ms":1779717976551,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":43245249,"p50":1,"p90":1,"p99":1,"max":7008,"mean":0.01}
+[2026-05-25T14:06:16.551489429Z INFO  yellowstone_latency] {"ts_ms":1779717976551,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":1516601,"p50":1673,"p90":1673,"p99":1673,"max":1673,"mean":1508.49}
+`;
+
+// ---- apples-to-apples optimized run at 50 subscribers (optimization branch; opt1 + opt2) ----
+const OPT50_LABEL = "Optimized (opt1 + opt2) · 50 subscribers";
+const OPT50_RAW = `
+[2026-05-26T08:29:17.678401134Z INFO  yellowstone_latency] {"ts_ms":1779784157678,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":6214949,"p50":1000,"p90":2000,"p99":15419,"max":15419,"mean":1196.05}
+[2026-05-26T08:29:17.678420224Z INFO  yellowstone_latency] {"ts_ms":1779784157678,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4484,"p50":1,"p90":1,"p99":50,"max":383,"mean":1.76}
+[2026-05-26T08:29:17.678436324Z INFO  yellowstone_latency] {"ts_ms":1779784157678,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":16736,"p50":2,"p90":5,"p99":5,"max":528,"mean":2.07}
+[2026-05-26T08:29:17.678440995Z INFO  yellowstone_latency] {"ts_ms":1779784157678,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":6214949,"p50":1,"p90":1,"p99":1,"max":794,"mean":0.00}
+[2026-05-26T08:29:17.678445375Z INFO  yellowstone_latency] {"ts_ms":1779784157678,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":212068,"p50":0,"p90":0,"p99":2,"max":10,"mean":0.08}
+[2026-05-26T08:29:27.678298546Z INFO  yellowstone_latency] {"ts_ms":1779784167678,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":6091644,"p50":1000,"p90":2000,"p99":20000,"max":20087,"mean":1189.11}
+[2026-05-26T08:29:27.678321906Z INFO  yellowstone_latency] {"ts_ms":1779784167678,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4398,"p50":1,"p90":1,"p99":50,"max":316,"mean":1.59}
+[2026-05-26T08:29:27.678327966Z INFO  yellowstone_latency] {"ts_ms":1779784167678,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":16352,"p50":2,"p90":5,"p99":5,"max":114,"mean":2.06}
+[2026-05-26T08:29:27.678332526Z INFO  yellowstone_latency] {"ts_ms":1779784167678,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":6091644,"p50":1,"p90":1,"p99":1,"max":531,"mean":0.00}
+[2026-05-26T08:29:27.678337976Z INFO  yellowstone_latency] {"ts_ms":1779784167678,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":208488,"p50":0,"p90":32,"p99":32,"max":41,"mean":5.65}
+[2026-05-26T08:29:37.678428587Z INFO  yellowstone_latency] {"ts_ms":1779784177678,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":6634641,"p50":1000,"p90":2000,"p99":17974,"max":17974,"mean":1185.52}
+[2026-05-26T08:29:37.678447037Z INFO  yellowstone_latency] {"ts_ms":1779784177678,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4725,"p50":1,"p90":1,"p99":50,"max":286,"mean":1.73}
+[2026-05-26T08:29:37.678452437Z INFO  yellowstone_latency] {"ts_ms":1779784177678,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":17668,"p50":2,"p90":5,"p99":5,"max":239,"mean":2.05}
+[2026-05-26T08:29:37.678456947Z INFO  yellowstone_latency] {"ts_ms":1779784177678,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":6634641,"p50":1,"p90":1,"p99":1,"max":296,"mean":0.00}
+[2026-05-26T08:29:37.678462677Z INFO  yellowstone_latency] {"ts_ms":1779784177678,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":225267,"p50":32,"p90":64,"p99":95,"max":95,"mean":28.59}
+[2026-05-26T08:29:47.678717779Z INFO  yellowstone_latency] {"ts_ms":1779784187678,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":6032943,"p50":1000,"p90":2000,"p99":15676,"max":15676,"mean":1167.25}
+[2026-05-26T08:29:47.678735789Z INFO  yellowstone_latency] {"ts_ms":1779784187678,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4344,"p50":1,"p90":1,"p99":50,"max":153,"mean":1.61}
+[2026-05-26T08:29:47.678740659Z INFO  yellowstone_latency] {"ts_ms":1779784187678,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":16152,"p50":2,"p90":5,"p99":5,"max":275,"mean":2.01}
+[2026-05-26T08:29:47.678744469Z INFO  yellowstone_latency] {"ts_ms":1779784187678,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":6032943,"p50":1,"p90":1,"p99":1,"max":252,"mean":0.00}
+[2026-05-26T08:29:47.678748629Z INFO  yellowstone_latency] {"ts_ms":1779784187678,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":205938,"p50":128,"p90":128,"p99":152,"max":152,"mean":87.10}
+[2026-05-26T08:29:57.677878069Z INFO  yellowstone_latency] {"ts_ms":1779784197677,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":4634110,"p50":1000,"p90":2000,"p99":19794,"max":19794,"mean":1133.98}
+[2026-05-26T08:29:57.677911879Z INFO  yellowstone_latency] {"ts_ms":1779784197677,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4861,"p50":1,"p90":1,"p99":50,"max":181,"mean":1.59}
+[2026-05-26T08:29:57.677930599Z INFO  yellowstone_latency] {"ts_ms":1779784197677,"metric":"fanout_send","unit":"microseconds","window_secs":10.0,"count":18148,"p50":1,"p90":5,"p99":5,"max":111,"mean":1.47}
+[2026-05-26T08:29:57.677937839Z INFO  yellowstone_latency] {"ts_ms":1779784197677,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":4634110,"p50":1,"p90":1,"p99":1,"max":387,"mean":0.00}
+`;
+
+// ---- apples-to-apples unoptimized run at 50 subscribers (unop-metrics branch) ----
+// NB: this capture did not include fanout_send lines, so that metric shows as "-" for this run.
+const UNOPT50_LABEL = "Unoptimized · 50 subscribers";
+const UNOPT50_RAW = `
+[2026-05-26T08:37:25.640072707Z INFO  yellowstone_latency] {"ts_ms":1779784645640,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":20800148,"p50":5000,"p90":10000,"p99":20000,"max":27556,"mean":3040.35}
+[2026-05-26T08:37:25.640088207Z INFO  yellowstone_latency] {"ts_ms":1779784645640,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3931,"p50":20,"p90":100,"p99":100,"max":289,"mean":21.70}
+[2026-05-26T08:37:25.640109837Z INFO  yellowstone_latency] {"ts_ms":1779784645640,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":20800148,"p50":1,"p90":1,"p99":1,"max":837,"mean":0.00}
+[2026-05-26T08:37:25.640121047Z INFO  yellowstone_latency] {"ts_ms":1779784645640,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":769807,"p50":0,"p90":0,"p99":1,"max":50,"mean":0.05}
+[2026-05-26T08:37:35.640680369Z INFO  yellowstone_latency] {"ts_ms":1779784655640,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":24212272,"p50":5000,"p90":10000,"p99":20000,"max":29270,"mean":3066.34}
+[2026-05-26T08:37:35.640700949Z INFO  yellowstone_latency] {"ts_ms":1779784655640,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4517,"p50":20,"p90":50,"p99":100,"max":262,"mean":21.56}
+[2026-05-26T08:37:35.640706299Z INFO  yellowstone_latency] {"ts_ms":1779784655640,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":24212272,"p50":1,"p90":1,"p99":1,"max":4123,"mean":0.00}
+[2026-05-26T08:37:35.640710799Z INFO  yellowstone_latency] {"ts_ms":1779784655640,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":885332,"p50":32,"p90":63,"p99":63,"max":63,"mean":21.93}
+[2026-05-26T08:37:45.640333500Z INFO  yellowstone_latency] {"ts_ms":1779784665640,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":24038616,"p50":2000,"p90":10000,"p99":20000,"max":30791,"mean":3151.29}
+[2026-05-26T08:37:45.640346390Z INFO  yellowstone_latency] {"ts_ms":1779784665640,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4485,"p50":20,"p90":100,"p99":100,"max":499,"mean":22.86}
+[2026-05-26T08:37:45.640355420Z INFO  yellowstone_latency] {"ts_ms":1779784665640,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":24038616,"p50":1,"p90":1,"p99":1,"max":3231,"mean":0.00}
+[2026-05-26T08:37:45.640376750Z INFO  yellowstone_latency] {"ts_ms":1779784665640,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":879060,"p50":64,"p90":99,"p99":99,"max":99,"mean":56.88}
+[2026-05-26T08:37:55.639931011Z INFO  yellowstone_latency] {"ts_ms":1779784675639,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":23807863,"p50":5000,"p90":10000,"p99":41503,"max":41503,"mean":3732.78}
+[2026-05-26T08:37:55.639950011Z INFO  yellowstone_latency] {"ts_ms":1779784675639,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4375,"p50":20,"p90":50,"p99":100,"max":701,"mean":21.69}
+[2026-05-26T08:37:55.639955271Z INFO  yellowstone_latency] {"ts_ms":1779784675639,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":23807863,"p50":1,"p90":1,"p99":1,"max":3102,"mean":0.00}
+[2026-05-26T08:37:55.639981321Z INFO  yellowstone_latency] {"ts_ms":1779784675639,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":855134,"p50":128,"p90":160,"p99":160,"max":160,"mean":97.22}
+[2026-05-26T08:38:05.640011232Z INFO  yellowstone_latency] {"ts_ms":1779784685640,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7123823,"p50":5000,"p90":10000,"p99":20000,"max":26012,"mean":3660.43}
+[2026-05-26T08:38:05.640038042Z INFO  yellowstone_latency] {"ts_ms":1779784685640,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4673,"p50":1,"p90":50,"p99":100,"max":468,"mean":6.16}
+[2026-05-26T08:38:05.640043122Z INFO  yellowstone_latency] {"ts_ms":1779784685640,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7123823,"p50":1,"p90":1,"p99":1,"max":1710,"mean":0.00}
+[2026-05-26T08:38:05.640048072Z INFO  yellowstone_latency] {"ts_ms":1779784685640,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":258513,"p50":180,"p90":180,"p99":180,"max":180,"mean":135.62}
+[2026-05-26T08:38:15.640482094Z INFO  yellowstone_latency] {"ts_ms":1779784695640,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":124753,"p50":500,"p90":2000,"p99":15469,"max":15469,"mean":932.46}
+[2026-05-26T08:38:15.640514804Z INFO  yellowstone_latency] {"ts_ms":1779784695640,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4563,"p50":1,"p90":1,"p99":5,"max":12,"mean":0.31}
+[2026-05-26T08:38:15.640520134Z INFO  yellowstone_latency] {"ts_ms":1779784695640,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":124753,"p50":1,"p90":1,"p99":1,"max":165,"mean":0.02}
+[2026-05-26T08:38:15.640524434Z INFO  yellowstone_latency] {"ts_ms":1779784695640,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":4563,"p50":0,"p90":4,"p99":8,"max":10,"mean":0.84}
+[2026-05-26T08:38:25.639937885Z INFO  yellowstone_latency] {"ts_ms":1779784705639,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":113842,"p50":500,"p90":2000,"p99":13365,"max":13365,"mean":903.47}
+[2026-05-26T08:38:25.639963205Z INFO  yellowstone_latency] {"ts_ms":1779784705639,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4189,"p50":1,"p90":1,"p99":5,"max":12,"mean":0.33}
+[2026-05-26T08:38:25.639968185Z INFO  yellowstone_latency] {"ts_ms":1779784705639,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":113842,"p50":1,"p90":1,"p99":1,"max":111,"mean":0.03}
+`;
+
+// ---- archived earlier runs (captured before fanout_send existed; no longer seeded) ----
+// ---- run 2: both optimizations enabled (opt1 cached metrics + opt2 sharded fan-out) ----
+const OPT_LABEL = "Optimized (opt1 + opt2)";
+const OPT_RAW = `
+[2026-05-25T11:46:57.684429903Z INFO  yellowstone_latency] {"ts_ms":1779709617684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4159,"p50":1,"p90":1,"p99":50,"max":186,"mean":1.24}
+[2026-05-25T11:47:07.683850933Z INFO  yellowstone_latency] {"ts_ms":1779709627683,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":730836,"p50":2000,"p90":5000,"p99":20000,"max":24903,"mean":1880.18}
+[2026-05-25T11:47:07.683894773Z INFO  yellowstone_latency] {"ts_ms":1779709627683,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3544,"p50":1,"p90":1,"p99":50,"max":171,"mean":1.45}
+[2026-05-25T11:47:07.683902963Z INFO  yellowstone_latency] {"ts_ms":1779709627683,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":731141,"p50":1,"p90":1,"p99":1,"max":33,"mean":0.00}
+[2026-05-25T11:47:07.683926683Z INFO  yellowstone_latency] {"ts_ms":1779709627683,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":25421,"p50":0,"p90":0,"p99":1,"max":1,"mean":0.03}
+[2026-05-25T11:47:17.684020794Z INFO  yellowstone_latency] {"ts_ms":1779709637684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7054625,"p50":2000,"p90":5000,"p99":16826,"max":16826,"mean":1530.27}
+[2026-05-25T11:47:17.684050204Z INFO  yellowstone_latency] {"ts_ms":1779709637684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3795,"p50":1,"p90":2,"p99":50,"max":205,"mean":2.01}
+[2026-05-25T11:47:17.684055174Z INFO  yellowstone_latency] {"ts_ms":1779709637684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7054320,"p50":1,"p90":1,"p99":1,"max":119,"mean":0.00}
+[2026-05-25T11:47:17.684060344Z INFO  yellowstone_latency] {"ts_ms":1779709637684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":243810,"p50":0,"p90":0,"p99":1,"max":3,"mean":0.03}
+[2026-05-25T11:47:27.684346094Z INFO  yellowstone_latency] {"ts_ms":1779709647684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7587090,"p50":1000,"p90":5000,"p99":20000,"max":21165,"mean":1405.16}
+[2026-05-25T11:47:27.684375014Z INFO  yellowstone_latency] {"ts_ms":1779709647684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4072,"p50":1,"p90":1,"p99":100,"max":672,"mean":2.37}
+[2026-05-25T11:47:27.684379964Z INFO  yellowstone_latency] {"ts_ms":1779709647684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7587090,"p50":1,"p90":1,"p99":1,"max":568,"mean":0.00}
+[2026-05-25T11:47:27.684385265Z INFO  yellowstone_latency] {"ts_ms":1779709647684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":261660,"p50":0,"p90":0,"p99":1,"max":12,"mean":0.08}
+[2026-05-25T11:47:37.684400325Z INFO  yellowstone_latency] {"ts_ms":1779709657684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7112770,"p50":2000,"p90":5000,"p99":17919,"max":17919,"mean":1499.95}
+[2026-05-25T11:47:37.684429965Z INFO  yellowstone_latency] {"ts_ms":1779709657684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3806,"p50":1,"p90":1,"p99":50,"max":403,"mean":1.96}
+[2026-05-25T11:47:37.684436275Z INFO  yellowstone_latency] {"ts_ms":1779709657684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7112770,"p50":1,"p90":1,"p99":1,"max":183,"mean":0.00}
+[2026-05-25T11:47:37.684443575Z INFO  yellowstone_latency] {"ts_ms":1779709657684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":245000,"p50":0,"p90":16,"p99":47,"max":47,"mean":2.72}
+[2026-05-25T11:47:47.684230305Z INFO  yellowstone_latency] {"ts_ms":1779709667684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7067410,"p50":1000,"p90":5000,"p99":20000,"max":29859,"mean":1463.65}
+[2026-05-25T11:47:47.684251005Z INFO  yellowstone_latency] {"ts_ms":1779709667684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3770,"p50":1,"p90":2,"p99":100,"max":194,"mean":2.05}
+[2026-05-25T11:47:47.684255995Z INFO  yellowstone_latency] {"ts_ms":1779709667684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7067410,"p50":1,"p90":1,"p99":1,"max":966,"mean":0.00}
+[2026-05-25T11:47:47.684261715Z INFO  yellowstone_latency] {"ts_ms":1779709667684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":243320,"p50":16,"p90":64,"p99":94,"max":94,"mean":21.15}
+[2026-05-25T11:47:57.684318246Z INFO  yellowstone_latency] {"ts_ms":1779709677684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7438690,"p50":2000,"p90":5000,"p99":20000,"max":25993,"mean":1456.30}
+[2026-05-25T11:47:57.684344926Z INFO  yellowstone_latency] {"ts_ms":1779709677684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3956,"p50":1,"p90":2,"p99":100,"max":223,"mean":2.08}
+[2026-05-25T11:47:57.684351176Z INFO  yellowstone_latency] {"ts_ms":1779709677684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7438690,"p50":1,"p90":1,"p99":1,"max":651,"mean":0.00}
+[2026-05-25T11:47:57.684356696Z INFO  yellowstone_latency] {"ts_ms":1779709677684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":255360,"p50":64,"p90":128,"p99":128,"max":163,"mean":39.54}
+[2026-05-25T11:48:07.683840466Z INFO  yellowstone_latency] {"ts_ms":1779709687683,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7250740,"p50":1000,"p90":5000,"p99":20000,"max":25732,"mean":1681.57}
+[2026-05-25T11:48:07.683862216Z INFO  yellowstone_latency] {"ts_ms":1779709687683,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3825,"p50":1,"p90":1,"p99":50,"max":233,"mean":1.96}
+[2026-05-25T11:48:07.683867196Z INFO  yellowstone_latency] {"ts_ms":1779709687683,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7250740,"p50":1,"p90":1,"p99":1,"max":335,"mean":0.00}
+[2026-05-25T11:48:07.683872596Z INFO  yellowstone_latency] {"ts_ms":1779709687683,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":248150,"p50":128,"p90":197,"p99":197,"max":197,"mean":89.44}
+[2026-05-25T11:48:17.683877566Z INFO  yellowstone_latency] {"ts_ms":1779709697683,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":9224110,"p50":1000,"p90":5000,"p99":17279,"max":17279,"mean":1374.74}
+[2026-05-25T11:48:17.683907016Z INFO  yellowstone_latency] {"ts_ms":1779709697683,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4759,"p50":1,"p90":2,"p99":50,"max":1834,"mean":2.28}
+[2026-05-25T11:48:17.683911986Z INFO  yellowstone_latency] {"ts_ms":1779709697683,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":9224110,"p50":1,"p90":1,"p99":1,"max":503,"mean":0.00}
+[2026-05-25T11:48:17.683921256Z INFO  yellowstone_latency] {"ts_ms":1779709697683,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":311990,"p50":512,"p90":1024,"p99":1024,"max":1067,"mean":437.43}
+[2026-05-25T11:48:27.684446087Z INFO  yellowstone_latency] {"ts_ms":1779709707684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8466005,"p50":1000,"p90":5000,"p99":20000,"max":20504,"mean":1412.92}
+[2026-05-25T11:48:27.684482417Z INFO  yellowstone_latency] {"ts_ms":1779709707684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4451,"p50":1,"p90":1,"p99":50,"max":227,"mean":1.91}
+[2026-05-25T11:48:27.684489387Z INFO  yellowstone_latency] {"ts_ms":1779709707684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8466464,"p50":1,"p90":1,"p99":1,"max":341,"mean":0.00}
+[2026-05-25T11:48:27.684497267Z INFO  yellowstone_latency] {"ts_ms":1779709707684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":289653,"p50":1891,"p90":1891,"p99":1891,"max":1891,"mean":1418.42}
+[2026-05-25T11:48:37.684224658Z INFO  yellowstone_latency] {"ts_ms":1779709717684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8304175,"p50":1000,"p90":5000,"p99":18625,"max":18625,"mean":1449.61}
+[2026-05-25T11:48:37.684249138Z INFO  yellowstone_latency] {"ts_ms":1779709717684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4327,"p50":1,"p90":2,"p99":50,"max":188,"mean":1.90}
+[2026-05-25T11:48:37.684255938Z INFO  yellowstone_latency] {"ts_ms":1779709717684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8303716,"p50":1,"p90":1,"p99":1,"max":1471,"mean":0.00}
+[2026-05-25T11:48:37.684260348Z INFO  yellowstone_latency] {"ts_ms":1779709717684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":282807,"p50":2660,"p90":2660,"p99":2660,"max":2660,"mean":2230.28}
+[2026-05-25T11:48:47.684011828Z INFO  yellowstone_latency] {"ts_ms":1779709727684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7581017,"p50":2000,"p90":5000,"p99":20000,"max":21110,"mean":1909.78}
+[2026-05-25T11:48:47.684045858Z INFO  yellowstone_latency] {"ts_ms":1779709727684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3993,"p50":1,"p90":2,"p99":50,"max":213,"mean":1.96}
+[2026-05-25T11:48:47.684053608Z INFO  yellowstone_latency] {"ts_ms":1779709727684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7581337,"p50":1,"p90":1,"p99":1,"max":413,"mean":0.00}
+[2026-05-25T11:48:47.684061438Z INFO  yellowstone_latency] {"ts_ms":1779709727684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":259300,"p50":3206,"p90":3206,"p99":3206,"max":3206,"mean":2835.34}
+[2026-05-25T11:48:57.684823269Z INFO  yellowstone_latency] {"ts_ms":1779709737684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7463803,"p50":1000,"p90":5000,"p99":17485,"max":17485,"mean":1432.32}
+[2026-05-25T11:48:57.684851069Z INFO  yellowstone_latency] {"ts_ms":1779709737684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3970,"p50":1,"p90":2,"p99":50,"max":208,"mean":2.01}
+[2026-05-25T11:48:57.684855819Z INFO  yellowstone_latency] {"ts_ms":1779709737684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7463483,"p50":1,"p90":1,"p99":1,"max":297,"mean":0.00}
+[2026-05-25T11:48:57.684860409Z INFO  yellowstone_latency] {"ts_ms":1779709737684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":256250,"p50":3695,"p90":3695,"p99":3695,"max":3695,"mean":3357.44}
+[2026-05-25T11:49:07.684228329Z INFO  yellowstone_latency] {"ts_ms":1779709747684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7773920,"p50":2000,"p90":5000,"p99":20000,"max":23558,"mean":1566.80}
+[2026-05-25T11:49:07.684255209Z INFO  yellowstone_latency] {"ts_ms":1779709747684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4122,"p50":1,"p90":2,"p99":50,"max":298,"mean":1.83}
+[2026-05-25T11:49:07.684262649Z INFO  yellowstone_latency] {"ts_ms":1779709747684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7773920,"p50":1,"p90":1,"p99":1,"max":353,"mean":0.00}
+[2026-05-25T11:49:07.684269319Z INFO  yellowstone_latency] {"ts_ms":1779709747684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":266560,"p50":3947,"p90":3947,"p99":3947,"max":3947,"mean":3743.88}
+[2026-05-25T11:49:17.684695770Z INFO  yellowstone_latency] {"ts_ms":1779709757684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7280700,"p50":1000,"p90":5000,"p99":18984,"max":18984,"mean":1458.79}
+[2026-05-25T11:49:17.684727270Z INFO  yellowstone_latency] {"ts_ms":1779709757684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3871,"p50":1,"p90":2,"p99":50,"max":202,"mean":2.06}
+[2026-05-25T11:49:17.684733250Z INFO  yellowstone_latency] {"ts_ms":1779709757684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7280700,"p50":1,"p90":1,"p99":1,"max":266,"mean":0.00}
+[2026-05-25T11:49:17.684765650Z INFO  yellowstone_latency] {"ts_ms":1779709757684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":249970,"p50":4096,"p90":4247,"p99":4247,"max":4247,"mean":3979.99}
+[2026-05-25T11:49:27.684139180Z INFO  yellowstone_latency] {"ts_ms":1779709767684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7273350,"p50":1000,"p90":5000,"p99":20000,"max":22147,"mean":1696.02}
+[2026-05-25T11:49:27.684163930Z INFO  yellowstone_latency] {"ts_ms":1779709767684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3880,"p50":1,"p90":2,"p99":50,"max":183,"mean":1.83}
+[2026-05-25T11:49:27.684169020Z INFO  yellowstone_latency] {"ts_ms":1779709767684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7273350,"p50":1,"p90":1,"p99":1,"max":633,"mean":0.00}
+[2026-05-25T11:49:27.684174260Z INFO  yellowstone_latency] {"ts_ms":1779709767684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":249900,"p50":4496,"p90":4496,"p99":4496,"max":4496,"mean":4240.69}
+[2026-05-25T11:49:37.684791881Z INFO  yellowstone_latency] {"ts_ms":1779709777684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":6938540,"p50":2000,"p90":5000,"p99":14482,"max":14482,"mean":1546.77}
+[2026-05-25T11:49:37.684824321Z INFO  yellowstone_latency] {"ts_ms":1779709777684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3719,"p50":1,"p90":2,"p99":100,"max":162,"mean":2.02}
+[2026-05-25T11:49:37.684829471Z INFO  yellowstone_latency] {"ts_ms":1779709777684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":6938540,"p50":1,"p90":1,"p99":1,"max":282,"mean":0.00}
+[2026-05-25T11:49:37.684834751Z INFO  yellowstone_latency] {"ts_ms":1779709777684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":238770,"p50":4681,"p90":4681,"p99":4681,"max":4681,"mean":4447.33}
+[2026-05-25T11:49:47.684817691Z INFO  yellowstone_latency] {"ts_ms":1779709787684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7296660,"p50":2000,"p90":5000,"p99":20000,"max":23687,"mean":1527.01}
+[2026-05-25T11:49:47.684846561Z INFO  yellowstone_latency] {"ts_ms":1779709787684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3893,"p50":1,"p90":2,"p99":50,"max":219,"mean":2.30}
+[2026-05-25T11:49:47.684851821Z INFO  yellowstone_latency] {"ts_ms":1779709787684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7296660,"p50":1,"p90":1,"p99":1,"max":832,"mean":0.00}
+[2026-05-25T11:49:47.684856551Z INFO  yellowstone_latency] {"ts_ms":1779709787684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":251090,"p50":4806,"p90":4806,"p99":4806,"max":4806,"mean":4613.87}
+[2026-05-25T11:49:57.684493781Z INFO  yellowstone_latency] {"ts_ms":1779709797684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":8174810,"p50":1000,"p90":5000,"p99":16939,"max":16939,"mean":1409.75}
+[2026-05-25T11:49:57.684523482Z INFO  yellowstone_latency] {"ts_ms":1779709797684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":4302,"p50":1,"p90":2,"p99":50,"max":265,"mean":2.02}
+[2026-05-25T11:49:57.684528582Z INFO  yellowstone_latency] {"ts_ms":1779709797684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":8175071,"p50":1,"p90":1,"p99":1,"max":584,"mean":0.00}
+[2026-05-25T11:49:57.684533542Z INFO  yellowstone_latency] {"ts_ms":1779709797684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":279241,"p50":4943,"p90":4943,"p99":4943,"max":4943,"mean":4766.62}
+[2026-05-25T11:50:07.684312842Z INFO  yellowstone_latency] {"ts_ms":1779709807684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":7400190,"p50":1000,"p90":5000,"p99":20000,"max":21820,"mean":1448.21}
+[2026-05-25T11:50:07.684336852Z INFO  yellowstone_latency] {"ts_ms":1779709807684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3930,"p50":1,"p90":2,"p99":100,"max":163,"mean":2.10}
+[2026-05-25T11:50:07.684341772Z INFO  yellowstone_latency] {"ts_ms":1779709807684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":7399929,"p50":1,"p90":1,"p99":1,"max":330,"mean":0.00}
+[2026-05-25T11:50:07.684346552Z INFO  yellowstone_latency] {"ts_ms":1779709807684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":254159,"p50":5075,"p90":5075,"p99":5075,"max":5075,"mean":4905.55}
+[2026-05-25T11:50:17.683936652Z INFO  yellowstone_latency] {"ts_ms":1779709817683,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":6876590,"p50":1000,"p90":5000,"p99":13792,"max":13792,"mean":1420.97}
+[2026-05-25T11:50:17.683971352Z INFO  yellowstone_latency] {"ts_ms":1779709817683,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3679,"p50":1,"p90":2,"p99":100,"max":328,"mean":2.15}
+[2026-05-25T11:50:17.683978672Z INFO  yellowstone_latency] {"ts_ms":1779709817683,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":6876590,"p50":1,"p90":1,"p99":1,"max":294,"mean":0.00}
+[2026-05-25T11:50:17.683986622Z INFO  yellowstone_latency] {"ts_ms":1779709817683,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":236530,"p50":5221,"p90":5221,"p99":5221,"max":5221,"mean":5041.83}
+[2026-05-25T11:50:27.684737733Z INFO  yellowstone_latency] {"ts_ms":1779709827684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":6591900,"p50":2000,"p90":5000,"p99":20000,"max":20008,"mean":1580.48}
+[2026-05-25T11:50:27.684760313Z INFO  yellowstone_latency] {"ts_ms":1779709827684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3551,"p50":1,"p90":2,"p99":100,"max":341,"mean":2.24}
+[2026-05-25T11:50:27.684767603Z INFO  yellowstone_latency] {"ts_ms":1779709827684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":6591900,"p50":1,"p90":1,"p99":1,"max":1599,"mean":0.00}
+[2026-05-25T11:50:27.684774493Z INFO  yellowstone_latency] {"ts_ms":1779709827684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":228410,"p50":5371,"p90":5371,"p99":5371,"max":5371,"mean":5183.34}
+[2026-05-25T11:50:37.684490863Z INFO  yellowstone_latency] {"ts_ms":1779709837684,"metric":"end_to_end","unit":"microseconds","window_secs":10.0,"count":3781805,"p50":1000,"p90":5000,"p99":16790,"max":16790,"mean":1538.52}
+[2026-05-25T11:50:37.684524163Z INFO  yellowstone_latency] {"ts_ms":1779709837684,"metric":"producer_send","unit":"microseconds","window_secs":10.0,"count":3760,"p50":1,"p90":2,"p99":100,"max":711,"mean":2.21}
+[2026-05-25T11:50:37.684530913Z INFO  yellowstone_latency] {"ts_ms":1779709837684,"metric":"filter_encode","unit":"microseconds","window_secs":10.0,"count":3781805,"p50":1,"p90":1,"p99":1,"max":120,"mean":0.00}
+[2026-05-25T11:50:37.684537373Z INFO  yellowstone_latency] {"ts_ms":1779709837684,"metric":"client_queue_depth","unit":"items","window_secs":10.0,"count":130265,"p50":5463,"p90":5463,"p99":5463,"max":5463,"mean":5306.49}
+`;
+
+// ---- state ----
+let runs = [];   // [{id,label,color,visible,samples:[{ts_ms,metric,p50,p90,p99,max,mean,count,unit}]}]
+let nextColor = 0;
+
+// ---- parsing ----
+function parseLogText(text) {
+  const samples = [];
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const i = line.indexOf("{");
+    if (i < 0) continue;
+    let obj;
+    try { obj = JSON.parse(line.slice(i)); } catch (e) { continue; }
+    if (obj == null || typeof obj.metric !== "string" || typeof obj.ts_ms !== "number") continue;
+    samples.push({
+      ts_ms: obj.ts_ms,
+      metric: obj.metric,
+      p50: num(obj.p50), p90: num(obj.p90), p99: num(obj.p99),
+      max: num(obj.max), mean: num(obj.mean),
+      count: num(obj.count),
+      unit: obj.unit || "",
+    });
+  }
+  return samples;
+}
+function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
+
+// ---- persistence ----
+function save() {
+  const slim = runs.map(r => ({ label: r.label, color: r.color, visible: r.visible, samples: r.samples }));
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(slim)); } catch (e) {}
+}
+function load() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return false;
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr) || arr.length === 0) return false;
+    runs = arr.map((r, idx) => ({
+      id: uid(), label: r.label || ("Run " + (idx+1)),
+      color: r.color || PALETTE[idx % PALETTE.length],
+      visible: r.visible !== false,
+      samples: Array.isArray(r.samples) ? r.samples : [],
+    }));
+    nextColor = runs.length;
+    return true;
+  } catch (e) { return false; }
+}
+
+let _uid = 0;
+function uid() { return "r" + (++_uid) + "_" + Date.now().toString(36); }
+
+function addRun(label, samples) {
+  if (!samples.length) throw new Error("No valid yellowstone_latency lines found.");
+  runs.push({ id: uid(), label, color: PALETTE[nextColor++ % PALETTE.length], visible: true, samples });
+  save();
+  renderAll();
+}
+
+function seedDefaults() {
+  // Apples-to-apples runs (all carry fanout_send). The older BASELINE_RAW/
+  // OPT_RAW runs predate fanout_send and are kept only as an archive.
+  addRun(UNOPT50_LABEL, parseLogText(UNOPT50_RAW));
+  addRun(OPT50_LABEL, parseLogText(OPT50_RAW));
+  addRun(UNOPT_LABEL, parseLogText(UNOPT_RAW));
+  addRun(OPT_AA_LABEL, parseLogText(OPT_AA_RAW));
+  addRun(UNOPT200_LABEL, parseLogText(UNOPT200_RAW));
+  addRun(OPT200_LABEL, parseLogText(OPT200_RAW));
+  addRun(UNOPT400_LABEL, parseLogText(UNOPT400_RAW));
+  addRun(OPT400_LABEL, parseLogText(OPT400_RAW));
+}
+
+// ---- helpers ----
+function currentStat() {
+  const el = document.querySelector('input[name=stat]:checked');
+  return el ? el.value : "p99";
+}
+function currentXMode() {
+  const el = document.querySelector('input[name=xaxis]:checked');
+  return el ? el.value : "rel";
+}
+function runMinTs(run) {
+  let m = Infinity;
+  for (const s of run.samples) if (s.ts_ms < m) m = s.ts_ms;
+  return isFinite(m) ? m : 0;
+}
+function fmt(v) {
+  if (v == null) return "–";
+  if (v >= 1000) return v.toLocaleString(undefined, {maximumFractionDigits: 0});
+  if (v >= 10) return (Math.round(v*10)/10).toString();
+  return (Math.round(v*100)/100).toString();
+}
+function niceNum(range, round) {
+  const exp = Math.floor(Math.log10(range));
+  const f = range / Math.pow(10, exp);
+  let nf;
+  if (round) nf = f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10;
+  else nf = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
+  return nf * Math.pow(10, exp);
+}
+
+// ---- chart rendering ----
+const chartState = {}; // metric.key -> {series, sx, sy, pad, plotW, plotH, W, H, xMode}
+
+function buildSeriesFor(metric, stat, xMode) {
+  const series = [];
+  for (const run of runs) {
+    if (!run.visible) continue;
+    const t0 = runMinTs(run);
+    const pts = [];
+    for (const s of run.samples) {
+      if (s.metric !== metric.key) continue;
+      const y = s[stat];
+      if (y == null) continue;
+      const x = xMode === "rel" ? (s.ts_ms - t0) / 1000 : s.ts_ms;
+      pts.push({ x, y, raw: s });
+    }
+    pts.sort((a,b) => a.x - b.x);
+    if (pts.length) series.push({ label: run.label, color: run.color, points: pts });
+  }
+  return series;
+}
+
+function drawChart(canvas, metric, stat, xMode) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 520;
+  const cssH = 300;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const W = cssW, H = cssH;
+  ctx.clearRect(0, 0, W, H);
+
+  const series = buildSeriesFor(metric, stat, xMode);
+  const pad = { l: 58, r: 14, t: 12, b: 34 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+
+  if (!series.length) {
+    ctx.fillStyle = "#8aa0b3";
+    ctx.font = "13px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("no data", W/2, H/2);
+    chartState[metric.key] = null;
+    return;
+  }
+
+  let xmin = Infinity, xmax = -Infinity, ymax = -Infinity;
+  for (const s of series) for (const p of s.points) {
+    if (p.x < xmin) xmin = p.x;
+    if (p.x > xmax) xmax = p.x;
+    if (p.y > ymax) ymax = p.y;
+  }
+  if (xmax === xmin) xmax = xmin + 1;
+  let ymin = 0;
+  if (ymax <= 0) ymax = 1;
+  const yrange = niceNum(ymax - ymin || 1, false);
+  const ytick = niceNum(yrange / 5, true);
+  const yTop = Math.ceil(ymax / ytick) * ytick;
+
+  const sx = x => pad.l + (x - xmin) / (xmax - xmin) * plotW;
+  const sy = y => pad.t + plotH - (y - ymin) / (yTop - ymin) * plotH;
+
+  // grid + y labels
+  ctx.strokeStyle = "#2a3640";
+  ctx.fillStyle = "#8aa0b3";
+  ctx.font = "11px sans-serif";
+  ctx.lineWidth = 1;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (let v = 0; v <= yTop + 1e-9; v += ytick) {
+    const y = sy(v);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + plotW, y); ctx.stroke();
+    ctx.fillText(fmt(v), pad.l - 6, y);
+  }
+  // x labels
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  const xTickCount = 5;
+  for (let i = 0; i <= xTickCount; i++) {
+    const xv = xmin + (xmax - xmin) * i / xTickCount;
+    const px = sx(xv);
+    ctx.strokeStyle = "#222c36";
+    ctx.beginPath(); ctx.moveTo(px, pad.t); ctx.lineTo(px, pad.t + plotH); ctx.stroke();
+    let lbl;
+    if (xMode === "rel") lbl = Math.round(xv) + "s";
+    else lbl = new Date(xv).toLocaleTimeString();
+    ctx.fillStyle = "#8aa0b3";
+    ctx.fillText(lbl, px, pad.t + plotH + 6);
+  }
+
+  // axis border
+  ctx.strokeStyle = "#3a4854";
+  ctx.strokeRect(pad.l, pad.t, plotW, plotH);
+
+  // lines
+  for (const s of series) {
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    s.points.forEach((p, i) => {
+      const px = sx(p.x), py = sy(p.y);
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+    // dots
+    ctx.fillStyle = s.color;
+    for (const p of s.points) {
+      ctx.beginPath();
+      ctx.arc(sx(p.x), sy(p.y), 2.2, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  chartState[metric.key] = { series, sx, sy, pad, plotW, plotH, W, H, xMode, stat, xmin, xmax };
+}
+
+// ---- tooltip ----
+const tooltip = document.getElementById("tooltip");
+function attachTooltip(canvas, metric) {
+  canvas.addEventListener("mousemove", ev => {
+    const st = chartState[metric.key];
+    if (!st) { tooltip.style.display = "none"; return; }
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    if (mx < st.pad.l || mx > st.pad.l + st.plotW) { tooltip.style.display = "none"; return; }
+    // nearest x among union of points
+    let best = null, bestDist = Infinity;
+    for (const s of st.series) for (const p of s.points) {
+      const d = Math.abs(st.sx(p.x) - mx);
+      if (d < bestDist) { bestDist = d; best = p; }
+    }
+    if (!best || bestDist > 40) { tooltip.style.display = "none"; return; }
+    const targetX = best.x;
+    let html = '<div class="tt-x">' +
+      (st.xMode === "rel" ? (Math.round(targetX) + "s into run") : new Date(targetX).toLocaleTimeString()) +
+      '</div>';
+    for (const s of st.series) {
+      // find the point in this series closest to targetX
+      let pp = null, dd = Infinity;
+      for (const p of s.points) { const d = Math.abs(p.x - targetX); if (d < dd) { dd = d; pp = p; } }
+      if (!pp || dd > (st.xmax - st.xmin) * 0.04 + 0.5) continue;
+      html += '<div class="tt-row"><span class="dot" style="background:' + s.color + '"></span>' +
+        s.label + ': <b>' + fmt(pp.y) + '</b> ' + (metric.unit) + '</div>';
+    }
+    tooltip.innerHTML = html;
+    tooltip.style.display = "block";
+    let tx = ev.clientX + 14, ty = ev.clientY + 14;
+    const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+    if (tx + tw > window.innerWidth) tx = ev.clientX - tw - 14;
+    if (ty + th > window.innerHeight) ty = ev.clientY - th - 14;
+    tooltip.style.left = tx + "px";
+    tooltip.style.top = ty + "px";
+  });
+  canvas.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
+}
+
+// ---- summary table ----
+function median(a) {
+  if (!a.length) return null;
+  const b = [...a].sort((x, y) => x - y);
+  const m = Math.floor(b.length / 2);
+  return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2;
+}
+
+// Aggregate one run's windows for a metric into the full stat set. Percentiles
+// are summarised as the median across 10s windows (steady-state typical) plus
+// the worst window seen; max = worst single sample; mean = count-weighted.
+function summarizeRunMetric(run, metricKey) {
+  const p50 = [], p90 = [], p99 = [], mx = [];
+  let meanSum = 0, cnt = 0, windows = 0;
+  for (const s of run.samples) {
+    if (s.metric !== metricKey) continue;
+    windows++;
+    if (s.p50 != null) p50.push(s.p50);
+    if (s.p90 != null) p90.push(s.p90);
+    if (s.p99 != null) p99.push(s.p99);
+    if (s.max != null) mx.push(s.max);
+    if (s.mean != null && s.count != null) { meanSum += s.mean * s.count; cnt += s.count; }
+  }
+  if (!windows) return null;
+  return {
+    p50: median(p50), p90: median(p90), p99: median(p99),
+    p99max: p99.length ? Math.max(...p99) : null,
+    max: mx.length ? Math.max(...mx) : null,
+    mean: cnt > 0 ? meanSum / cnt : null,
+    windows,
+  };
+}
+
+// Stats shown as rows under each metric (one column per run).
+const SUMMARY_STATS = [
+  { key: "p50",    label: "p50" },
+  { key: "p90",    label: "p90" },
+  { key: "p99",    label: "p99",       hi: true },
+  { key: "p99max", label: "worst p99" },
+  { key: "max",    label: "max" },
+  { key: "mean",   label: "mean" },
+];
+
+function renderSummary() {
+  const tbl = document.getElementById("summary");
+  const visRuns = runs.filter(r => r.visible);
+  if (!visRuns.length) { tbl.innerHTML = ""; return; }
+
+  // One column per run; rows are metric × stat, so adding a run adds a column.
+  let html = "<thead><tr><th class='run'>Metric</th><th class='run'>Stat</th>";
+  for (const r of visRuns) {
+    const nWindows = new Set(r.samples.map(s => s.ts_ms)).size;
+    html += "<th class='runhdr'><span class='dot' style='background:" + r.color + "'></span>" +
+      escapeHtml(r.label) + "<br><span class='runmeta'>" + nWindows + " windows</span></th>";
+  }
+  html += "</tr></thead><tbody>";
+
+  for (const m of METRICS) {
+    const sums = visRuns.map(r => summarizeRunMetric(r, m.key));
+    if (sums.every(s => !s)) continue; // no visible run has this metric
+    SUMMARY_STATS.forEach((st, i) => {
+      html += "<tr" + (st.hi ? " class='hi-row'" : "") + ">";
+      if (i === 0) {
+        html += "<td class='run metric-cell' rowspan='" + SUMMARY_STATS.length + "'><b>" +
+          escapeHtml(m.title) + "</b>" + infoIconHtml(m) + "<br><span class='runmeta'>" + m.unit + "</span></td>";
+      }
+      html += "<td class='run stat-name'>" + st.label + "</td>";
+      for (const s of sums) {
+        html += "<td>" + fmt(s ? s[st.key] : null) + "</td>";
+      }
+      html += "</tr>";
+    });
+  }
+  html += "</tbody>";
+  html += "<caption><b>p50 / p90 / p99</b> = median of the 10s-window percentiles (steady-state typical); " +
+    "<b>worst p99</b> = highest window p99; <b>max</b> = worst single sample; <b>mean</b> = count-weighted. " +
+    "Time metrics in µs, queue depth in items. Each captured run adds a column.</caption>";
+  tbl.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// ---- run list ----
+function renderRunList() {
+  const ul = document.getElementById("runList");
+  if (!runs.length) { ul.innerHTML = '<li class="empty">No runs loaded.</li>'; return; }
+  ul.innerHTML = "";
+  for (const run of runs) {
+    const li = document.createElement("li");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = run.visible;
+    cb.addEventListener("change", () => { run.visible = cb.checked; save(); renderCharts(); renderSummary(); });
+    const sw = document.createElement("span");
+    sw.className = "swatch"; sw.style.background = run.color;
+    const nm = document.createElement("span");
+    nm.className = "runname";
+    const nWindows = new Set(run.samples.map(s => s.ts_ms)).size;
+    nm.innerHTML = escapeHtml(run.label) + ' <span class="runmeta">(' + nWindows + ' windows)</span>';
+    nm.title = run.label;
+    const x = document.createElement("span");
+    x.className = "x"; x.textContent = "✕"; x.title = "Remove run";
+    x.addEventListener("click", () => {
+      runs = runs.filter(r => r.id !== run.id);
+      save(); renderAll();
+    });
+    li.append(cb, sw, nm, x);
+    ul.appendChild(li);
+  }
+}
+
+// ---- charts container ----
+function ensureChartCards() {
+  const grid = document.getElementById("charts");
+  if (grid.dataset.built) return;
+  for (const m of METRICS) {
+    const card = document.createElement("div");
+    card.className = "chartcard";
+    card.innerHTML = '<div class="ct"><b>' + m.title + ' <span style="color:#8aa0b3">(' + m.unit + ')</span>' +
+      infoIconHtml(m) + '</b><span>' + m.desc + '</span></div>';
+    const cv = document.createElement("canvas");
+    cv.id = "cv_" + m.key;
+    card.appendChild(cv);
+    grid.appendChild(card);
+    attachTooltip(cv, m);
+  }
+  grid.dataset.built = "1";
+}
+
+function renderCharts() {
+  ensureChartCards();
+  const stat = currentStat();
+  const xMode = currentXMode();
+  for (const m of METRICS) {
+    const cv = document.getElementById("cv_" + m.key);
+    drawChart(cv, m, stat, xMode);
+  }
+}
+
+function renderAll() {
+  renderRunList();
+  renderCharts();
+  renderSummary();
+}
+
+// ---- events ----
+document.getElementById("addBtn").addEventListener("click", () => {
+  const errEl = document.getElementById("addErr");
+  errEl.textContent = "";
+  const label = (document.getElementById("runLabel").value || "").trim() || ("Run " + (runs.length + 1));
+  const text = document.getElementById("runText").value || "";
+  try {
+    addRun(label, parseLogText(text));
+    document.getElementById("runLabel").value = "";
+    document.getElementById("runText").value = "";
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
+});
+
+document.getElementById("fileBtn").addEventListener("click", () => document.getElementById("fileInput").click());
+document.getElementById("fileInput").addEventListener("change", ev => {
+  const errEl = document.getElementById("addErr");
+  errEl.textContent = "";
+  const files = Array.from(ev.target.files || []);
+  let pending = files.length;
+  files.forEach(file => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const baseLabel = file.name.replace(/\.[^.]+$/, "");
+        addRun(baseLabel, parseLogText(String(reader.result)));
+      } catch (e) { errEl.textContent = file.name + ": " + e.message; }
+      if (--pending === 0) ev.target.value = "";
+    };
+    reader.readAsText(file);
+  });
+});
+
+document.querySelectorAll('input[name=stat]').forEach(el =>
+  el.addEventListener("change", () => { renderCharts(); renderSummary(); }));
+document.querySelectorAll('input[name=xaxis]').forEach(el =>
+  el.addEventListener("change", renderCharts));
+
+document.getElementById("clearBtn").addEventListener("click", () => {
+  if (!confirm("Remove all loaded runs?")) return;
+  runs = []; nextColor = 0; save(); renderAll();
+});
+document.getElementById("resetBtn").addEventListener("click", () => {
+  if (runs.length) {
+    if (!confirm("Re-add the built-in baseline + optimized runs?")) return;
+  }
+  seedDefaults();
+});
+
+window.addEventListener("resize", () => { renderCharts(); });
+
+// Flip a metric info-popover to the left when it would overflow the viewport's right edge.
+function placeInfoPop(icon) {
+  const pop = icon.querySelector(".info-pop");
+  if (!pop) return;
+  const r = icon.getBoundingClientRect();
+  pop.classList.toggle("flip-right", r.left + 300 > window.innerWidth - 8);
+}
+document.addEventListener("mouseover", ev => {
+  const icon = ev.target.closest && ev.target.closest(".info-icon");
+  if (icon) placeInfoPop(icon);
+});
+document.addEventListener("focusin", ev => {
+  const icon = ev.target.closest && ev.target.closest(".info-icon");
+  if (icon) placeInfoPop(icon);
+});
+
+// ---- init ----
+if (!load()) {
+  seedDefaults();
+} else {
+  renderAll();
+}
+</script>
+</body>
+</html>

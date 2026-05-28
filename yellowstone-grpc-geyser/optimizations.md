@@ -11,6 +11,14 @@ This is evident in the code. It is not a single bug but **several compounding
 `O(number_of_subscribers)` costs that all sit on the critical path of every
 message**.
 
+> **Update (2026-05-27): the verdict above is the original *a-priori hypothesis*,
+> and measurement has since falsified most of it.** None of the optimizations
+> built from it produced an observable end-to-end latency win, and the headline
+> factor (#1, the `broadcast` wake-all) turned out **not** to be the dominant
+> cost. See **[Results & post-mortem](#results--post-mortem)** at the end of this
+> document for every attempt and why each failed. The factor analysis below is
+> retained as the original investigation record.
+
 ## Architecture (relevant part)
 
 `geyser_loop` (`src/grpc.rs:741`) is a **single task** that ingests all geyser
@@ -225,3 +233,76 @@ the fan-out API).
 3. Compare `end_to_end` and `producer_send` percentiles (and
    `client_queue_depth`) between the two runs. Optionally check the **layer-2**
    commit in isolation to attribute the gain between the two optimizations.
+
+---
+
+## Results & post-mortem
+
+*What we actually tried, and why each failed — updated 2026-05-27.*
+
+The hypothesis at the top of this document drove the optimizations below.
+**Measurement falsified most of it.** None of the attempts produced an observable
+end-to-end latency improvement; opt2 made latency *worse* at low-to-moderate
+subscriber counts (tested up to ~700). The symptom we were chasing throughout:
+the per-client outbound queue depth **creeps up and does not drain fast** as
+subscriber count grows.
+
+### Every attempt at a glance
+
+| Attempt | What it changed | Outcome | Why it failed |
+|---|---|---|---|
+| **opt1** — cached metric handles + bounded cardinality (factors #4, #5) | Resolve `IntCounter`/`IntGauge` handles once per session instead of `with_label_values` per message; `remove_label_values` on last disconnect. | No measurable latency change. | The `with_label_values` overhead was never on the latency-critical path. Legitimate **hygiene** (it does fix the unbounded per-subscriber metric-cardinality leak, factor #5), but not a latency fix. |
+| **opt2** — relay sharded fan-out (factors #1, #2) | Replace the single `broadcast` with per-commitment channels; shard the hot `processed` wake-all across `processed_fanout_shards` relay tasks. | **Worse** at ≤700 subscribers; no win at any tested N. | (1) Adds an async hop `producer → relay → subscriber` = pure added latency where there is no O(N) wake to amortize. (2) The O(N) broadcast wake it targets is **not** the dominant cost — this directly **falsifies factor #1**. (3) It *relocates* fan-out work to relay tasks rather than reducing it; total wakeups are unchanged. (4) Unblocking the producer pushes more downstream, so per-client queues fill *faster*. |
+| **Lever 1** — encode-once / shared-body fan-out | Pre-encode the whole `FilteredUpdateOneof` body once per message, then per-subscriber only frame filter-names + memcpy the shared body. | Ruled out by microbenchmark **before** touching the system. | The existing `pre_encoded` cache (`message.rs:496`) already dedups the body for the dominant warm account/tx path (no `data_slice`). The residual per-subscriber cost is the **body memcpy into each connection's own buffer**, which is unavoidable per-connection and identical with or without lever 1. Bench (`benches/encode.rs::bench_fanout`, warm cache, 400 subs): 165 B acct 1.58×, but 0 B acct and txn slightly *slower*, 2 MB acct 0.98× (no change) — i.e. tens-of-nanoseconds noise either way. |
+| **Lever 3** — HTTP/2 flow-control windows | Enlarge `server_initial_stream_window_size` / `server_initial_connection_window_size`; enable `server_http2_adaptive_window` (config-only, no code). | No improvement. | The per-client queue drain is not gated by the HTTP/2 window size in this setup → flow-control is not the wall. |
+
+(A separate, non-optimization diagnostic — relocating the `end_to_end` measure
+point from the client loop to the outbound-queue *dequeue* — confirmed that the
+outbound-queue **wait** is a real leg that the original `end_to_end` did not
+capture.)
+
+### What is now eliminated as the bottleneck
+
+- **Metric overhead** — opt1 was negligible for latency.
+- **The `broadcast` wake-all (factor #1, the original "dominant" factor)** —
+  opt2 sharded exactly this and it did not help. Falsified.
+- **Per-subscriber serialization** — lever-1 bench shows ~90 ns/sub for normal
+  messages; the only material residual is unavoidable per-connection memcpy.
+- **HTTP/2 flow-control window size** — lever-3 config A/B showed no change.
+
+### What the data does show
+
+- The encode/serialize step is cheap (~tens-to-~100 ns per subscriber for normal
+  messages). The unavoidable per-connection **body memcpy** dominates for large
+  payloads: a 2 MB account fanned to 400 subscribers ≈ **800 MB copied per
+  message**.
+- The per-client outbound queue capacity is **250,000** (`channel_capacity`,
+  reused for the outbound channel at `grpc.rs:1567`). A slow-draining client
+  therefore buffers up to 250k messages before the `client_channel_full`
+  disconnect — the "queue creeps up" symptom is this buffer filling.
+
+### Still open — next probe (not yet done)
+
+Two hypotheses remain, and they are distinguished by a single observation —
+**per-core CPU under high-N load**, which has not yet been captured:
+
+1. **CPU/scheduler-bound consumer fan-out** — N `client_loop` task wakeups +
+   `get_updates` (filter match) + memcpy per message saturate the worker pool
+   (cores pegged ~100%). → pursue reducing per-subscriber work / a shared
+   refcounted-`Bytes` fan-out (the only thing that removes the N× memcpy, and
+   only when subscribers share identical filter output).
+2. **Serial `geyser_loop` ceiling** — the single ingest/encode/broadcast task
+   cannot keep up (cores have idle headroom while queues grow). → pursue the
+   producer side (e.g. `message_queue_size` growth, `client_broadcast_lag`).
+
+Resolve with a flamegraph + `mpstat -P ALL 1` during a high-N run **before**
+attempting any further optimization.
+
+### Lesson
+
+opt1, opt2, lever-1, and lever-3 all targeted a leg of the pipeline that was
+not the actual bottleneck. The recurring mistake was **building the fix before
+measuring the leg**. The encode bench (which killed lever 1 in minutes, with no
+system change) and the lever-3 config A/B (zero code) are the model to follow:
+isolate and measure the suspected leg cheaply, and only implement once the data
+confirms it.
