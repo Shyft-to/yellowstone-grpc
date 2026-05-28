@@ -351,6 +351,15 @@ pub struct ConfigGrpc {
     pub server_initial_connection_window_size: Option<u32>,
     #[serde(default)]
     pub server_initial_stream_window_size: Option<u32>,
+    /// Interval (seconds) for emitting end-to-end fan-out latency percentiles
+    /// to the `yellowstone_e2e` log target as NDJSON. `0` (the default)
+    /// disables recording; the per-message hook then short-circuits on a
+    /// single relaxed atomic load. See `src/latency.rs`.
+    #[serde(
+        default = "ConfigGrpc::latency_metrics_interval_seconds_default",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub latency_metrics_interval_seconds: u64,
 
     ///
     /// After how many bytes a TCP connection should update its traffic metrics for prometheus.
@@ -403,6 +412,10 @@ impl ConfigGrpc {
 
     const fn encoder_threads_default() -> usize {
         4
+    }
+
+    const fn latency_metrics_interval_seconds_default() -> u64 {
+        0
     }
 }
 

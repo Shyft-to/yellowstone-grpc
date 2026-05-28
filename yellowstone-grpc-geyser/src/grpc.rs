@@ -1,6 +1,7 @@
 use {
     crate::{
         config::{ConfigGrpc, GrpcAddress},
+        latency::{EndToEndTimedStream, LatencyMetrics},
         metered::MeteredLayer,
         metrics::{
             self, incr_grpc_method_call_count, set_subscriber_queue_size,
@@ -533,6 +534,7 @@ pub struct GrpcService {
     replay_first_available_slot: Option<Arc<AtomicU64>>,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
     filter_names: Arc<Mutex<FilterNames>>,
+    latency: Arc<LatencyMetrics>,
     cancellation_token: CancellationToken,
     task_tracker: TaskTracker,
 }
@@ -640,6 +642,16 @@ impl GrpcService {
             config.filter_names_cleanup_interval,
         )));
 
+        // End-to-end latency profiling. `interval = 0` keeps recording
+        // disabled and the per-message hook short-circuits on one atomic load.
+        let latency_interval = config.latency_metrics_interval_seconds;
+        let latency = LatencyMetrics::new(latency_interval > 0);
+        Arc::clone(&latency).spawn_reporter(
+            latency_interval,
+            service_cancellation_token.child_token(),
+            task_tracker.clone(),
+        );
+
         // Build the shared GeyserServer (Clone-able because GrpcService: Clone)
         let max_decoding_message_size = config.max_decoding_message_size;
         let mut service = GeyserServer::new(Self {
@@ -657,6 +669,7 @@ impl GrpcService {
             replay_first_available_slot: replay_first_available_slot.clone(),
             debug_clients_tx,
             filter_names,
+            latency,
             cancellation_token: service_cancellation_token.clone(),
             task_tracker: task_tracker.clone(),
         })
@@ -1494,7 +1507,7 @@ impl GrpcService {
 
 #[tonic::async_trait]
 impl Geyser for GrpcService {
-    type SubscribeStream = LoadAwareReceiver<TonicResult<FilteredUpdate>>;
+    type SubscribeStream = EndToEndTimedStream;
     type SubscribeDeshredStream =
         LoadAwareReceiver<TonicResult<yellowstone_grpc_proto::geyser::SubscribeUpdateDeshred>>;
 
@@ -1685,7 +1698,10 @@ impl Geyser for GrpcService {
             Arc::clone(&self.subscription_tracker),
         ));
 
-        Ok(Response::new(stream_rx))
+        Ok(Response::new(EndToEndTimedStream::new(
+            stream_rx,
+            Arc::clone(&self.latency),
+        )))
     }
 
     async fn subscribe_deshred(
