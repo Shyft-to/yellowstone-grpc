@@ -3,8 +3,8 @@ use {
         config::{ConfigGrpc, GrpcAddress},
         metered::MeteredLayer,
         metrics::{
-            self, incr_grpc_method_call_count, set_subscriber_queue_size,
-            subscription_limit_exceeded_inc, DebugClientMessage,
+            self, incr_grpc_method_call_count, subscription_limit_exceeded_inc,
+            DebugClientMessage, SubscriberMetrics,
         },
         parallel::ParallelEncoder,
         plugin::{
@@ -383,6 +383,7 @@ struct ClientSession {
     disconnect_reason: &'static str,
     maybe_remote_peer_sk_addr: Option<SocketAddr>,
     subscription_tracker: SubscriptionTracker,
+    metrics: SubscriberMetrics,
 }
 
 impl ClientSession {
@@ -397,6 +398,7 @@ impl ClientSession {
     ) -> Self {
         let filter = Filter::default();
         let subscriber_id = subscriber_id.unwrap_or("UNKNOWN".to_owned());
+        let metrics = SubscriberMetrics::new(&subscriber_id);
         if let Some(remote_peer_sk_addr) = maybe_remote_peer_sk_addr {
             let mut subscriptions_per_remote_addr =
                 CONCURRENT_SUBSCRIPTIONS_PER_REMOTE_PEER_SK_ADDR
@@ -427,6 +429,7 @@ impl ClientSession {
             disconnect_reason: "unknown",
             maybe_remote_peer_sk_addr,
             subscription_tracker,
+            metrics,
         }
     }
 
@@ -480,7 +483,7 @@ impl Drop for ClientSession {
                 }
             }
         }
-        set_subscriber_queue_size(&self.subscriber_id, 0);
+        self.metrics.set_queue_size(0);
         metrics::incr_client_disconnect(&self.subscriber_id, self.disconnect_reason);
         metrics::update_subscriptions(&self.endpoint, Some(&self.filter), None);
         DebugClientMessage::maybe_send(&self.debug_client_tx, || DebugClientMessage::Removed {
@@ -1160,7 +1163,7 @@ impl GrpcService {
         }
 
         'outer: loop {
-            set_subscriber_queue_size(&session.subscriber_id, stream_tx.queue_size());
+            session.metrics.set_queue_size(stream_tx.queue_size());
 
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
@@ -1239,8 +1242,8 @@ impl GrpcService {
                                         let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                         match stream_tx.send(Ok(message)).await {
                                             Ok(()) => {
-                                                metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
-                                                metrics::incr_grpc_bytes_sent(&session.subscriber_id, proto_size);
+                                                session.metrics.incr_message_sent();
+                                                session.metrics.incr_bytes_sent(proto_size);
                                             }
                                             Err(mpsc::error::SendError(_)) => {
                                                 error!("client #{id}: stream closed");
@@ -1285,8 +1288,8 @@ impl GrpcService {
                                 let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                 match stream_tx.try_send(Ok(message)) {
                                     Ok(()) => {
-                                        metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
-                                        metrics::incr_grpc_bytes_sent(&session.subscriber_id, proto_size);
+                                        session.metrics.incr_message_sent();
+                                        session.metrics.incr_bytes_sent(proto_size);
                                     }
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         error!("client #{id}: lagged to send an update");

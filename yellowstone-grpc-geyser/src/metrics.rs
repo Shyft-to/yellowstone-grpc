@@ -1,7 +1,13 @@
 // When the `no-metrics` feature is enabled, each recording wrapper early-returns
 // before its body; silence the resulting unreachable-code / unused-parameter
 // lints in this file. No effect when the feature is off.
-#![cfg_attr(feature = "no-metrics", allow(unreachable_code, unused_variables))]
+// `missing_const_for_fn` is also allowed under the feature because the
+// `SubscriberMetrics` recording methods collapse to empty bodies that clippy
+// would otherwise want marked `const`. No effect when the feature is off.
+#![cfg_attr(
+    feature = "no-metrics",
+    allow(unreachable_code, unused_variables, clippy::missing_const_for_fn)
+)]
 
 use {
     crate::{
@@ -476,18 +482,61 @@ pub fn incr_geyser_event_dropped<S: AsRef<str>>(event: S) {
         .inc();
 }
 
-pub fn incr_grpc_bytes_sent<S: AsRef<str>>(remote_id: S, byte_sent: u32) {
-    #[cfg(feature = "no-metrics")] return;
-    GRPC_BYTES_SENT
-        .with_label_values(&[remote_id.as_ref()])
-        .inc_by(byte_sent as u64);
+/// Per-subscriber metric child handles resolved once at subscription setup so
+/// the fan-out hot path records via lock-free atomic ops on its own counter
+/// cells, instead of taking the shared `*Vec` read-lock and hashing the
+/// `subscriber_id` for a map lookup on every message (what `with_label_values`
+/// does internally). Each subscriber owns distinct label cells, so there is no
+/// cross-subscriber cache-line sharing on the increments either.
+///
+/// Replaces the former free functions `incr_grpc_message_sent_counter`,
+/// `incr_grpc_bytes_sent` and `set_subscriber_queue_size`, whose recorded series
+/// (`grpc_message_sent_count`, `grpc_bytes_sent`, `grpc_subscriber_queue_size`)
+/// are preserved unchanged.
+pub struct SubscriberMetrics {
+    #[cfg(not(feature = "no-metrics"))]
+    grpc_message_sent: IntCounter,
+    #[cfg(not(feature = "no-metrics"))]
+    grpc_bytes_sent: IntCounter,
+    #[cfg(not(feature = "no-metrics"))]
+    grpc_subscriber_queue_size: IntGauge,
 }
 
-pub fn incr_grpc_message_sent_counter<S: AsRef<str>>(remote_id: S) {
-    #[cfg(feature = "no-metrics")] return;
-    GRPC_MESSAGE_SENT
-        .with_label_values(&[remote_id.as_ref()])
-        .inc();
+impl SubscriberMetrics {
+    pub fn new(subscriber_id: &str) -> Self {
+        #[cfg(not(feature = "no-metrics"))]
+        {
+            Self {
+                grpc_message_sent: GRPC_MESSAGE_SENT.with_label_values(&[subscriber_id]),
+                grpc_bytes_sent: GRPC_BYTES_SENT.with_label_values(&[subscriber_id]),
+                grpc_subscriber_queue_size: GRPC_SUBSCRIBER_QUEUE_SIZE
+                    .with_label_values(&[subscriber_id]),
+            }
+        }
+        #[cfg(feature = "no-metrics")]
+        {
+            let _ = subscriber_id;
+            Self {}
+        }
+    }
+
+    #[inline]
+    pub fn incr_message_sent(&self) {
+        #[cfg(not(feature = "no-metrics"))]
+        self.grpc_message_sent.inc();
+    }
+
+    #[inline]
+    pub fn incr_bytes_sent(&self, byte_sent: u32) {
+        #[cfg(not(feature = "no-metrics"))]
+        self.grpc_bytes_sent.inc_by(byte_sent as u64);
+    }
+
+    #[inline]
+    pub fn set_queue_size(&self, size: u64) {
+        #[cfg(not(feature = "no-metrics"))]
+        self.grpc_subscriber_queue_size.set(size as i64);
+    }
 }
 
 pub fn update_slot_status(status: &GeyserSlosStatus, slot: u64) {
@@ -573,13 +622,6 @@ pub fn set_subscriber_send_bandwidth_load<S: AsRef<str>>(subscriber_id: S, load:
     GRPC_SUBSCRIBER_SEND_BANDWIDTH_LOAD
         .with_label_values(&[subscriber_id.as_ref()])
         .set(load);
-}
-
-pub fn set_subscriber_queue_size<S: AsRef<str>>(subscriber_id: S, size: u64) {
-    #[cfg(feature = "no-metrics")] return;
-    GRPC_SUBSCRIBER_QUEUE_SIZE
-        .with_label_values(&[subscriber_id.as_ref()])
-        .set(size as i64);
 }
 
 pub fn incr_client_disconnect<S: AsRef<str>>(subscriber_id: S, reason: &str) {
