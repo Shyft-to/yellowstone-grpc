@@ -101,6 +101,7 @@ pub struct MeteredBody<B> {
     inner: B,
     subscriber_id: String,
     uri_path: String,
+    outbound_bytes: metrics::ServiceOutboundBytes,
 }
 
 #[pinned_drop]
@@ -126,11 +127,7 @@ where
         match ready!(this.inner.as_mut().poll_frame(cx)) {
             Some(Ok(frame)) => {
                 if let Some(data) = frame.data_ref() {
-                    metrics::add_grpc_service_outbound_bytes(
-                        this.subscriber_id,
-                        this.uri_path,
-                        data.remaining() as u64,
-                    );
+                    this.outbound_bytes.add(data.remaining() as u64);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -165,10 +162,12 @@ where
             Ok(response) => {
                 let (parts, body) = response.into_parts();
                 increment_active_metered_bodies_for_subscriber_and_path(&subscriber_id, &uri_path);
+                let outbound_bytes = metrics::ServiceOutboundBytes::new(&subscriber_id, &uri_path);
                 let metered_body = MeteredBody {
                     inner: body,
                     subscriber_id,
                     uri_path,
+                    outbound_bytes,
                 };
                 Poll::Ready(Ok(Response::from_parts(parts, metered_body)))
             }

@@ -648,15 +648,41 @@ pub fn incr_grpc_method_call_count<S: AsRef<str>>(method: S) {
         .inc();
 }
 
-pub fn add_grpc_service_outbound_bytes<S: AsRef<str>, P: AsRef<str>>(
-    subscriber_id: S,
-    uri_path: P,
-    bytes: u64,
-) {
-    #[cfg(feature = "no-metrics")] return;
-    GRPC_SERVICE_OUTBOUND_BYTES
-        .with_label_values(&[subscriber_id.as_ref(), uri_path.as_ref()])
-        .add(bytes as i64);
+/// Cached `grpc_service_outbound_bytes` gauge handle for one
+/// `(subscriber_id, uri_path)` pair, resolved once per metered response body so
+/// the per-frame hot path records via a lock-free atomic add, instead of taking
+/// the shared `IntGaugeVec` read-lock and hashing both labels for a map lookup
+/// on every body frame (what `with_label_values` does internally).
+///
+/// Replaces the former free function `add_grpc_service_outbound_bytes`; the
+/// recorded `grpc_service_outbound_bytes` series is unchanged. The cold reset on
+/// body teardown still goes through `reset_grpc_service_outbound_bytes`.
+pub struct ServiceOutboundBytes {
+    #[cfg(not(feature = "no-metrics"))]
+    grpc_service_outbound_bytes: IntGauge,
+}
+
+impl ServiceOutboundBytes {
+    pub fn new(subscriber_id: &str, uri_path: &str) -> Self {
+        #[cfg(not(feature = "no-metrics"))]
+        {
+            Self {
+                grpc_service_outbound_bytes: GRPC_SERVICE_OUTBOUND_BYTES
+                    .with_label_values(&[subscriber_id, uri_path]),
+            }
+        }
+        #[cfg(feature = "no-metrics")]
+        {
+            let _ = (subscriber_id, uri_path);
+            Self {}
+        }
+    }
+
+    #[inline]
+    pub fn add(&self, bytes: u64) {
+        #[cfg(not(feature = "no-metrics"))]
+        self.grpc_service_outbound_bytes.add(bytes as i64);
+    }
 }
 
 pub fn reset_grpc_service_outbound_bytes<S: AsRef<str>, P: AsRef<str>>(
