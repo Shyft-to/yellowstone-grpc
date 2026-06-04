@@ -1,14 +1,3 @@
-// When the `no-metrics` feature is enabled, each recording wrapper early-returns
-// before its body; silence the resulting unreachable-code / unused-parameter
-// lints in this file. No effect when the feature is off.
-// `missing_const_for_fn` is also allowed under the feature because the
-// `SubscriberMetrics` recording methods collapse to empty bodies that clippy
-// would otherwise want marked `const`. No effect when the feature is off.
-#![cfg_attr(
-    feature = "no-metrics",
-    allow(unreachable_code, unused_variables, clippy::missing_const_for_fn)
-)]
-
 use {
     crate::{
         config::ConfigPrometheus,
@@ -476,8 +465,6 @@ fn not_found_handler() -> http::Result<Response<BoxBody<Bytes, Infallible>>> {
 }
 
 pub fn incr_geyser_event_dropped<S: AsRef<str>>(event: S) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GEYSER_EVENT_DROPPED
         .with_label_values(&[event.as_ref()])
         .inc();
@@ -495,70 +482,50 @@ pub fn incr_geyser_event_dropped<S: AsRef<str>>(event: S) {
 /// (`grpc_message_sent_count`, `grpc_bytes_sent`, `grpc_subscriber_queue_size`)
 /// are preserved unchanged.
 pub struct SubscriberMetrics {
-    #[cfg(not(feature = "no-metrics"))]
     grpc_message_sent: IntCounter,
-    #[cfg(not(feature = "no-metrics"))]
     grpc_bytes_sent: IntCounter,
-    #[cfg(not(feature = "no-metrics"))]
     grpc_subscriber_queue_size: IntGauge,
 }
 
 impl SubscriberMetrics {
     pub fn new(subscriber_id: &str) -> Self {
-        #[cfg(not(feature = "no-metrics"))]
-        {
-            Self {
-                grpc_message_sent: GRPC_MESSAGE_SENT.with_label_values(&[subscriber_id]),
-                grpc_bytes_sent: GRPC_BYTES_SENT.with_label_values(&[subscriber_id]),
-                grpc_subscriber_queue_size: GRPC_SUBSCRIBER_QUEUE_SIZE
-                    .with_label_values(&[subscriber_id]),
-            }
-        }
-        #[cfg(feature = "no-metrics")]
-        {
-            let _ = subscriber_id;
-            Self {}
+        Self {
+            grpc_message_sent: GRPC_MESSAGE_SENT.with_label_values(&[subscriber_id]),
+            grpc_bytes_sent: GRPC_BYTES_SENT.with_label_values(&[subscriber_id]),
+            grpc_subscriber_queue_size: GRPC_SUBSCRIBER_QUEUE_SIZE
+                .with_label_values(&[subscriber_id]),
         }
     }
 
     #[inline]
     pub fn incr_message_sent(&self) {
-        #[cfg(not(feature = "no-metrics"))]
         self.grpc_message_sent.inc();
     }
 
     #[inline]
     pub fn incr_bytes_sent(&self, byte_sent: u32) {
-        #[cfg(not(feature = "no-metrics"))]
         self.grpc_bytes_sent.inc_by(byte_sent as u64);
     }
 
     #[inline]
     pub fn set_queue_size(&self, size: u64) {
-        #[cfg(not(feature = "no-metrics"))]
         self.grpc_subscriber_queue_size.set(size as i64);
     }
 }
 
 pub fn update_slot_status(status: &GeyserSlosStatus, slot: u64) {
-    #[cfg(feature = "no-metrics")]
-    return;
     SLOT_STATUS
         .with_label_values(&[status.as_str()])
         .set(slot as i64);
 }
 
 pub fn update_slot_plugin_status(status: SlotStatus, slot: u64) {
-    #[cfg(feature = "no-metrics")]
-    return;
     SLOT_STATUS_PLUGIN
         .with_label_values(&[status.as_str()])
         .set(slot as i64);
 }
 
 pub fn update_invalid_blocks(reason: impl AsRef<str>) {
-    #[cfg(feature = "no-metrics")]
-    return;
     INVALID_FULL_BLOCKS
         .with_label_values(&[reason.as_ref()])
         .inc();
@@ -566,40 +533,28 @@ pub fn update_invalid_blocks(reason: impl AsRef<str>) {
 }
 
 pub fn message_queue_size_inc() {
-    #[cfg(feature = "no-metrics")]
-    return;
     MESSAGE_QUEUE_SIZE.inc()
 }
 
 pub fn message_queue_size_dec() {
-    #[cfg(feature = "no-metrics")]
-    return;
     MESSAGE_QUEUE_SIZE.dec()
 }
 
 pub fn connections_total_inc() {
-    #[cfg(feature = "no-metrics")]
-    return;
     CONNECTIONS_TOTAL.inc()
 }
 
 pub fn connections_total_dec() {
-    #[cfg(feature = "no-metrics")]
-    return;
     CONNECTIONS_TOTAL.dec()
 }
 
 pub fn subscription_limit_exceeded_inc<S: AsRef<str>>(subscriber_id: S) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GRPC_SUBSCRIPTION_LIMIT_EXCEEDED
         .with_label_values(&[subscriber_id.as_ref()])
         .inc();
 }
 
 pub fn update_subscriptions(endpoint: &str, old: Option<&Filter>, new: Option<&Filter>) {
-    #[cfg(feature = "no-metrics")]
-    return;
     for (multiplier, filter) in [(-1, old), (1, new)] {
         if let Some(filter) = filter {
             SUBSCRIPTIONS_TOTAL
@@ -616,50 +571,36 @@ pub fn update_subscriptions(endpoint: &str, old: Option<&Filter>, new: Option<&F
 }
 
 pub fn missed_status_message_inc(status: SlotStatus) {
-    #[cfg(feature = "no-metrics")]
-    return;
     MISSED_STATUS_MESSAGE
         .with_label_values(&[status.as_str()])
         .inc()
 }
 
 pub fn observe_geyser_account_update_received(data_bytesize: usize) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GEYSER_ACCOUNT_UPDATE_RECEIVED.observe(data_bytesize as f64 / 1024.0);
 }
 
 pub fn set_subscriber_send_bandwidth_load<S: AsRef<str>>(subscriber_id: S, load: i64) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GRPC_SUBSCRIBER_SEND_BANDWIDTH_LOAD
         .with_label_values(&[subscriber_id.as_ref()])
         .set(load);
 }
 
 pub fn incr_client_disconnect<S: AsRef<str>>(subscriber_id: S, reason: &str) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GRPC_CLIENT_DISCONNECTS
         .with_label_values(&[subscriber_id.as_ref(), reason])
         .inc();
 }
 
 pub fn pre_encoded_cache_hit(msg_type: &str) {
-    #[cfg(feature = "no-metrics")]
-    return;
     PRE_ENCODED_CACHE_HIT.with_label_values(&[msg_type]).inc();
 }
 
 pub fn pre_encoded_cache_miss(msg_type: &str) {
-    #[cfg(feature = "no-metrics")]
-    return;
     PRE_ENCODED_CACHE_MISS.with_label_values(&[msg_type]).inc();
 }
 
 pub fn incr_grpc_method_call_count<S: AsRef<str>>(method: S) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GRPC_METHOD_CALL_COUNT
         .with_label_values(&[method.as_ref()])
         .inc();
@@ -675,29 +616,19 @@ pub fn incr_grpc_method_call_count<S: AsRef<str>>(method: S) {
 /// recorded `grpc_service_outbound_bytes` series is unchanged. The cold reset on
 /// body teardown still goes through `reset_grpc_service_outbound_bytes`.
 pub struct ServiceOutboundBytes {
-    #[cfg(not(feature = "no-metrics"))]
     grpc_service_outbound_bytes: IntGauge,
 }
 
 impl ServiceOutboundBytes {
     pub fn new(subscriber_id: &str, uri_path: &str) -> Self {
-        #[cfg(not(feature = "no-metrics"))]
-        {
-            Self {
-                grpc_service_outbound_bytes: GRPC_SERVICE_OUTBOUND_BYTES
-                    .with_label_values(&[subscriber_id, uri_path]),
-            }
-        }
-        #[cfg(feature = "no-metrics")]
-        {
-            let _ = (subscriber_id, uri_path);
-            Self {}
+        Self {
+            grpc_service_outbound_bytes: GRPC_SERVICE_OUTBOUND_BYTES
+                .with_label_values(&[subscriber_id, uri_path]),
         }
     }
 
     #[inline]
     pub fn add(&self, bytes: u64) {
-        #[cfg(not(feature = "no-metrics"))]
         self.grpc_service_outbound_bytes.add(bytes as i64);
     }
 }
@@ -706,30 +637,22 @@ pub fn reset_grpc_service_outbound_bytes<S: AsRef<str>, P: AsRef<str>>(
     subscriber_id: S,
     uri_path: P,
 ) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GRPC_SERVICE_OUTBOUND_BYTES
         .with_label_values(&[subscriber_id.as_ref(), uri_path.as_ref()])
         .set(0);
 }
 
 pub fn add_total_traffic_sent(bytes: u64) {
-    #[cfg(feature = "no-metrics")]
-    return;
     TOTAL_TRAFFIC_SENT.inc_by(bytes);
 }
 
 pub fn add_traffic_sent_per_remote_ip<S: AsRef<str>>(remote_ip: S, bytes: u64) {
-    #[cfg(feature = "no-metrics")]
-    return;
     TRAFFIC_SENT_PER_REMOTE_IP
         .with_label_values(&[remote_ip.as_ref()])
         .inc_by(bytes);
 }
 
 pub fn reset_traffic_sent_per_remote_ip<S: AsRef<str>>(remote_ip: S) {
-    #[cfg(feature = "no-metrics")]
-    return;
     TRAFFIC_SENT_PER_REMOTE_IP
         .with_label_values(&[remote_ip.as_ref()])
         .reset();
@@ -742,16 +665,12 @@ pub fn set_grpc_concurrent_subscribe_per_tcp_connection<S: AsRef<str>>(
     remote_peer_sk_addr: S,
     size: u64,
 ) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GRPC_CONCURRENT_SUBSCRIBE_PER_TCP_CONNECTION
         .with_label_values(&[remote_peer_sk_addr.as_ref()])
         .set(size as i64);
 }
 
 pub fn remove_grpc_concurrent_subscribe_per_tcp_connection<S: AsRef<str>>(remote_peer_sk_addr: S) {
-    #[cfg(feature = "no-metrics")]
-    return;
     GRPC_CONCURRENT_SUBSCRIBE_PER_TCP_CONNECTION
         .remove_label_values(&[remote_peer_sk_addr.as_ref()])
         .expect("remove_label_values");
@@ -759,8 +678,6 @@ pub fn remove_grpc_concurrent_subscribe_per_tcp_connection<S: AsRef<str>>(remote
 
 /// Reset all metrics on plugin unload to prevent metric accumulation across plugin lifecycle
 pub fn reset_metrics() {
-    #[cfg(feature = "no-metrics")]
-    return;
     // Reset gauge metrics to 0
     CONNECTIONS_TOTAL.set(0);
     MESSAGE_QUEUE_SIZE.set(0);

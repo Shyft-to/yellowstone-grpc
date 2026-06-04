@@ -998,7 +998,6 @@ impl GrpcService {
 
                             // processed
                             processed_messages.push(message.clone());
-                            #[cfg(not(feature = "no-metrics"))]
                             metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                             let encoded = parallel_encoder.encode(processed_messages).await;
                             let _ =
@@ -1040,7 +1039,6 @@ impl GrpcService {
                                 || !confirmed_messages.is_empty()
                                 || !finalized_messages.is_empty()
                             {
-                                #[cfg(not(feature = "no-metrics"))]
                                 metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                                 let encoded = parallel_encoder.encode(processed_messages).await;
                                 let _ = broadcast_tx
@@ -1065,7 +1063,6 @@ impl GrpcService {
                 }
                 () = &mut processed_sleep => {
                     if !processed_messages.is_empty() {
-                        #[cfg(not(feature = "no-metrics"))]
                         metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                         let encoded = parallel_encoder.encode(processed_messages).await;
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
