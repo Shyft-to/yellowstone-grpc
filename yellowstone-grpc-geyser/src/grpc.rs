@@ -3,8 +3,8 @@ use {
         config::{ConfigGrpc, GrpcAddress},
         metered::MeteredLayer,
         metrics::{
-            self, incr_grpc_method_call_count, subscription_limit_exceeded_inc,
-            DebugClientMessage, SubscriberMetrics,
+            self, incr_grpc_method_call_count, subscription_limit_exceeded_inc, DebugClientMessage,
+            SubscriberMetrics,
         },
         parallel::ParallelEncoder,
         plugin::{
