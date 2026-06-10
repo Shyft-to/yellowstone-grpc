@@ -341,17 +341,6 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub encoder_threads: usize,
-    /// Maximum time (ms) a processed message may dwell in the batch buffer before
-    /// being flushed.  The adaptive flush (flush when the inbound queue is empty)
-    /// already sends most messages with zero timer wait; this is a safety-net upper
-    /// bound for continuous-stream conditions where the queue is never transiently
-    /// empty.  Default 10 ms preserves stock behaviour; lower values reduce worst-
-    /// case tail latency at the cost of smaller average batch sizes under load.
-    #[serde(
-        default = "ConfigGrpc::default_processed_messages_sleep_ms",
-        deserialize_with = "deserialize_int_str"
-    )]
-    pub processed_messages_sleep_ms: u64,
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]
@@ -414,10 +403,6 @@ impl ConfigGrpc {
 
     const fn encoder_threads_default() -> usize {
         4
-    }
-
-    const fn default_processed_messages_sleep_ms() -> u64 {
-        10
     }
 }
 
