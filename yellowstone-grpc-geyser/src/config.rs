@@ -341,6 +341,10 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub encoder_threads: usize,
+    /// CPU core to pin the geyser dispatch thread to (enables busy-poll spin loop).
+    /// If None, geyser_loop runs as a normal async tokio task with the 10ms batch timer.
+    #[serde(default)]
+    pub geyser_dispatch_cpu_core: Option<usize>,
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]
