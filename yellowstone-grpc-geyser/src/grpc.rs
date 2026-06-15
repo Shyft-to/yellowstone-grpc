@@ -1588,6 +1588,9 @@ impl GrpcService {
 
                                 messages.sort_by_key(|msg| msg.0);
                                 for (_msgid, message) in messages.iter() {
+                                    if !session.filter.can_match_message(message) {
+                                        continue;
+                                    }
                                     for message in session.filter.get_updates(message, Some(commitment)) {
                                         let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                         match stream_tx.send(Ok(message)).await {
@@ -1634,6 +1637,9 @@ impl GrpcService {
 
                     if commitment == session.filter.get_commitment_level() {
                         for (_msgid, message) in messages.iter() {
+                            if !session.filter.can_match_message(message) {
+                                continue;
+                            }
                             for message in session.filter.get_updates(message, Some(commitment)) {
                                 let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                 match stream_tx.try_send(Ok(message)) {
@@ -1737,6 +1743,9 @@ impl GrpcService {
                 }
             };
 
+            if !filter.can_match_message(&message) {
+                continue;
+            }
             for message in filter.get_updates(&message, None) {
                 if stream_tx.send(Ok(message)).await.is_err() {
                     error!("client #{id}: stream closed");
