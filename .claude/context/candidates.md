@@ -43,9 +43,9 @@ At 500 subs this saves ~1-4 CPU cores of filter work → drains the broadcast qu
 
 ---
 
-### C3: Replace tokio::broadcast with lock-free per-subscriber queue [OPEN]
+### C3: Replace tokio::broadcast with lock-free per-subscriber queue [PASS]
 tier: 1
-experiment_ref:
+experiment_ref: 2026-06-15T12:00:00Z
 
 **Bottleneck:** `tokio::broadcast::send()` (grpc.rs:1023, 1033, 1038) acquires an internal Mutex,
 writes to a ring buffer, then calls `wake()` on ALL N subscriber Wakers sequentially.
@@ -73,9 +73,9 @@ Bounded queue: if full, the subscriber is considered "lagged" (same semantics as
 
 ---
 
-### C4: Inline encode + direct write for single-filter subscribers [OPEN]
+### C4: Inline encode + direct write for single-filter subscribers [PASS]
 tier: 1
-experiment_ref:
+experiment_ref: 2026-06-15T12:00:00Z
 
 **Bottleneck:** The path from `geyser_dispatch` to the TCP socket has 4 async hops:
 `broadcast` → `client_loop` tokio task wake → `stream_tx.try_send` → tonic codec encodes and writes.
@@ -105,9 +105,9 @@ broadcast path for all others. Do not touch ParallelEncoder.
 
 ## Tier 2 — Medium Impact (10-100ms potential)
 
-### C5: Remove `encoded_len()` from hot path [OPEN]
+### C5: Remove `encoded_len()` from hot path [PASS]
 tier: 2
-experiment_ref:
+experiment_ref: 2026-06-15T12:01:00Z
 
 **Bottleneck:** grpc.rs:1638 — `let proto_size = message.encoded_len()` is called for every
 FilteredUpdate sent to every subscriber. `encoded_len()` traverses the entire proto tree
@@ -124,9 +124,9 @@ Per-subscriber byte count becomes approximate but the correctness of message del
 
 ---
 
-### C6: SmallVec for FilteredUpdates [OPEN]
+### C6: SmallVec for FilteredUpdates [RULED_OUT]
 tier: 2
-experiment_ref:
+experiment_ref: 2026-06-15T12:02:00Z
 
 **Bottleneck:** `FilteredUpdates` is `Vec<FilteredUpdate>` (plugin/filter/message.rs).
 `filter.get_updates()` creates a new empty Vec on every call and typically pushes 0 or 1 items.
@@ -211,6 +211,9 @@ Add `last_queue_size: u64` to avoid the atomic store when value hasn't changed.
 ---
 
 ## Ruled out
+
+### C6: SmallVec for FilteredUpdates [RULED_OUT]
+**Reason (2026-06-15):** Already implemented in the codebase — `FilteredUpdates` is `SmallVec<[FilteredUpdate; 2]>` in plugin/filter/message.rs, `smallvec` is a workspace dep. No change needed.
 
 ### C1: Shard broadcast by commitment level [RULED_OUT]
 **Reason (2026-06-15):** ~90% of messages are `CommitmentLevel::Processed`. Sharding into 3 channels
