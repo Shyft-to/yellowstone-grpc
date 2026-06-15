@@ -44,7 +44,7 @@ use {
     tokio::{
         fs,
         net::UnixListener,
-        sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
+        sync::{mpsc, oneshot, Mutex, RwLock, Semaphore},
         time::{sleep, Duration, Instant},
     },
     tokio_stream::wrappers::UnixListenerStream,
@@ -352,6 +352,32 @@ impl SlotMessages {
 
 type BroadcastedMessage = (CommitmentLevel, Arc<Vec<(u64, Message)>>);
 
+type SubscriberEntry = (usize, Arc<mpsc::UnboundedSender<BroadcastedMessage>>);
+type SubscriberSenders = Arc<StdMutex<Arc<Vec<SubscriberEntry>>>>;
+
+/// Push one message to every subscriber without holding the list Mutex across the sends.
+/// The Mutex is held for an O(1) Arc clone only; each send is a lock-free CAS.
+fn fan_out(subscriber_senders: &SubscriberSenders, msg: BroadcastedMessage) {
+    let list = subscriber_senders.lock().unwrap().clone();
+    for (_, tx) in list.iter() {
+        let _ = tx.send(msg.clone());
+    }
+}
+
+/// Removes the subscriber from the sender list when client_loop exits (any path).
+struct SubscriberGuard {
+    id: usize,
+    senders: SubscriberSenders,
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        let mut guard = self.senders.lock().unwrap();
+        let new_list: Vec<SubscriberEntry> = guard.iter().filter(|(sid, _)| *sid != self.id).cloned().collect();
+        *guard = Arc::new(new_list);
+    }
+}
+
 enum ReplayedResponse {
     Messages(Vec<(u64, Message)>),
     Lagged(Slot),
@@ -531,7 +557,7 @@ pub struct GrpcService {
     blocks_meta: Option<Arc<BlockMetaStorage>>,
     subscribe_id: Arc<AtomicUsize>,
     snapshot_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<Box<Message>>>>>,
-    broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+    subscriber_senders: SubscriberSenders,
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
@@ -604,8 +630,8 @@ impl GrpcService {
             (Some(blocks_meta), Some(blocks_meta_tx))
         };
 
-        // Messages to clients combined by commitment
-        let (broadcast_tx, _) = broadcast::channel(config.channel_capacity);
+        // Per-subscriber lock-free fan-out (replaces tokio::broadcast)
+        let subscriber_senders: SubscriberSenders = Arc::new(StdMutex::new(Arc::new(vec![])));
         let (replay_first_available_slot, replay_stored_slots_tx, replay_stored_slots_rx) =
             if config.replay_stored_slots == 0 {
                 (None, None, None)
@@ -655,7 +681,7 @@ impl GrpcService {
             blocks_meta: blocks_meta.map(Arc::new),
             subscribe_id: Arc::new(AtomicUsize::new(0)),
             snapshot_rx: Arc::new(Mutex::new(snapshot_rx)),
-            broadcast_tx: broadcast_tx.clone(),
+            subscriber_senders: subscriber_senders.clone(),
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
             debug_clients_tx,
@@ -692,7 +718,7 @@ impl GrpcService {
                     Self::geyser_dispatch(
                         messages_rx,
                         blocks_meta_tx,
-                        broadcast_tx,
+                        subscriber_senders.clone(),
                         replay_stored_slots_rx,
                         replay_first_available_slot,
                         config.replay_stored_slots,
@@ -705,7 +731,7 @@ impl GrpcService {
                 Self::geyser_loop(
                     messages_rx,
                     blocks_meta_tx,
-                    broadcast_tx,
+                    subscriber_senders,
                     replay_stored_slots_rx,
                     replay_first_available_slot,
                     config.replay_stored_slots,
@@ -764,7 +790,7 @@ impl GrpcService {
     async fn geyser_loop(
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
-        broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        subscriber_senders: SubscriberSenders,
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
@@ -1020,8 +1046,7 @@ impl GrpcService {
                             processed_messages.push(message.clone());
                             metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                             let encoded = parallel_encoder.encode(processed_messages).await;
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+                            fan_out(&subscriber_senders, (CommitmentLevel::Processed, encoded.into()));
                             processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                             processed_sleep
                                 .as_mut()
@@ -1029,13 +1054,11 @@ impl GrpcService {
 
                             // confirmed
                             confirmed_messages.push(message.clone());
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+                            fan_out(&subscriber_senders, (CommitmentLevel::Confirmed, confirmed_messages.into()));
 
                             // finalized
                             finalized_messages.push(message);
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
+                            fan_out(&subscriber_senders, (CommitmentLevel::Finalized, finalized_messages.into()));
                         } else {
                             let mut confirmed_messages = vec![];
                             let mut finalized_messages = vec![];
@@ -1061,8 +1084,7 @@ impl GrpcService {
                             {
                                 metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                                 let encoded = parallel_encoder.encode(processed_messages).await;
-                                let _ = broadcast_tx
-                                    .send((CommitmentLevel::Processed, encoded.into()));
+                                fan_out(&subscriber_senders, (CommitmentLevel::Processed, encoded.into()));
                                 processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                                 processed_sleep
                                     .as_mut()
@@ -1070,13 +1092,11 @@ impl GrpcService {
                             }
 
                             if !confirmed_messages.is_empty() {
-                                let _ =
-                                    broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+                                fan_out(&subscriber_senders, (CommitmentLevel::Confirmed, confirmed_messages.into()));
                             }
 
                             if !finalized_messages.is_empty() {
-                                let _ =
-                                    broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
+                                fan_out(&subscriber_senders, (CommitmentLevel::Finalized, finalized_messages.into()));
                             }
                         }
                     }
@@ -1085,7 +1105,7 @@ impl GrpcService {
                     if !processed_messages.is_empty() {
                         metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                         let encoded = parallel_encoder.encode(processed_messages).await;
-                        let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+                        fan_out(&subscriber_senders, (CommitmentLevel::Processed, encoded.into()));
                         processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                     }
                     processed_sleep.as_mut().reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
@@ -1126,7 +1146,7 @@ impl GrpcService {
     fn geyser_dispatch(
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
-        broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        subscriber_senders: SubscriberSenders,
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
@@ -1357,16 +1377,16 @@ impl GrpcService {
                             processed_messages.push(message.clone());
                             metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                             let encoded = parallel_encoder.encode_blocking(processed_messages);
-                            let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+                            fan_out(&subscriber_senders, (CommitmentLevel::Processed, encoded.into()));
                             processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
 
                             // confirmed
                             confirmed_messages.push(message.clone());
-                            let _ = broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+                            fan_out(&subscriber_senders, (CommitmentLevel::Confirmed, confirmed_messages.into()));
 
                             // finalized
                             finalized_messages.push(message);
-                            let _ = broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
+                            fan_out(&subscriber_senders, (CommitmentLevel::Finalized, finalized_messages.into()));
                         } else {
                             let mut confirmed_messages = vec![];
                             let mut finalized_messages = vec![];
@@ -1392,16 +1412,16 @@ impl GrpcService {
                             {
                                 metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                                 let encoded = parallel_encoder.encode_blocking(processed_messages);
-                                let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+                                fan_out(&subscriber_senders, (CommitmentLevel::Processed, encoded.into()));
                                 processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                             }
 
                             if !confirmed_messages.is_empty() {
-                                let _ = broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+                                fan_out(&subscriber_senders, (CommitmentLevel::Confirmed, confirmed_messages.into()));
                             }
 
                             if !finalized_messages.is_empty() {
-                                let _ = broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
+                                fan_out(&subscriber_senders, (CommitmentLevel::Finalized, finalized_messages.into()));
                             }
                         }
                     }
@@ -1411,7 +1431,7 @@ impl GrpcService {
                     if !processed_messages.is_empty() {
                         metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                         let encoded = parallel_encoder.encode_blocking(processed_messages);
-                        let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+                        fan_out(&subscriber_senders, (CommitmentLevel::Processed, encoded.into()));
                         processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                     }
 
@@ -1460,7 +1480,9 @@ impl GrpcService {
         stream_tx: LoadAwareSender<TonicResult<FilteredUpdate>>,
         mut client_rx: mpsc::UnboundedReceiver<Option<(Option<u64>, Filter)>>,
         mut snapshot_rx: Option<crossbeam_channel::Receiver<Box<Message>>>,
-        mut messages_rx: broadcast::Receiver<BroadcastedMessage>,
+        mut messages_rx: mpsc::UnboundedReceiver<BroadcastedMessage>,
+        subscriber_senders: SubscriberSenders,
+        lag_threshold: usize,
         replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
         maybe_remote_peer_sk_addr: Option<SocketAddr>,
@@ -1478,6 +1500,7 @@ impl GrpcService {
             subscription_tracker,
         );
         let cancellation_token = session.cancellation_token.clone();
+        let _sub_guard = SubscriberGuard { id, senders: subscriber_senders };
 
         if let Some(snapshot_rx) = snapshot_rx.take() {
             info!("client #{id}: snapshot requested");
@@ -1620,20 +1643,20 @@ impl GrpcService {
                 }
                 message = messages_rx.recv() => {
                     let (commitment, messages) = match message {
-                        Ok((commitment, messages)) => (commitment, messages),
-                        Err(broadcast::error::RecvError::Closed) => {
+                        Some((commitment, messages)) => (commitment, messages),
+                        None => {
                             session.disconnect_reason = "broadcast_closed";
-                            break 'outer;
-                        },
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            info!("client #{id}: lagged to receive geyser messages");
-                            task_tracker.spawn(async move {
-                                let _ = stream_tx.send(Err(Status::internal("lagged to receive geyser messages"))).await;
-                            });
-                            session.disconnect_reason = "client_broadcast_lag";
                             break 'outer;
                         }
                     };
+                    if messages_rx.len() > lag_threshold {
+                        info!("client #{id}: lagged to receive geyser messages");
+                        task_tracker.spawn(async move {
+                            let _ = stream_tx.send(Err(Status::internal("lagged to receive geyser messages"))).await;
+                        });
+                        session.disconnect_reason = "client_broadcast_lag";
+                        break 'outer;
+                    }
 
                     if commitment == session.filter.get_commitment_level() {
                         for (_msgid, message) in messages.iter() {
@@ -2038,7 +2061,19 @@ impl Geyser for GrpcService {
             stream_tx,
             client_rx,
             snapshot_rx,
-            self.broadcast_tx.subscribe(),
+            {
+                let (tx, rx) = mpsc::unbounded_channel::<BroadcastedMessage>();
+                let tx = Arc::new(tx);
+                {
+                    let mut guard = self.subscriber_senders.lock().unwrap();
+                    let mut new_list = (**guard).clone();
+                    new_list.push((id, Arc::clone(&tx)));
+                    *guard = Arc::new(new_list);
+                }
+                rx
+            },
+            self.subscriber_senders.clone(),
+            self.config_channel_capacity,
             self.replay_stored_slots_tx.clone(),
             self.debug_clients_tx.clone(),
             maybe_remote_peer_sk_addr,
@@ -2225,7 +2260,13 @@ mod tests {
         let ct = CancellationToken::new();
         let tt = TaskTracker::new();
         let st: SubscriptionTracker = Arc::new(StdMutex::new(HashMap::new()));
-        let (broadcast_tx, _) = broadcast::channel::<BroadcastedMessage>(16);
+        let sub_senders: SubscriberSenders = Arc::new(StdMutex::new(Arc::new(vec![])));
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<BroadcastedMessage>();
+        let test_msg_tx = Arc::new(msg_tx);
+        {
+            let mut guard = sub_senders.lock().unwrap();
+            *guard = Arc::new(vec![(0usize, Arc::clone(&test_msg_tx))]);
+        }
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (stream_tx, stream_rx) = load_aware_channel(16);
         let (half_close_tx, half_close_rx) = oneshot::channel();
@@ -2246,7 +2287,9 @@ mod tests {
             stream_tx,
             client_rx,
             None,
-            broadcast_tx.subscribe(),
+            msg_rx,
+            sub_senders,
+            16,
             None,
             None,
             None,
@@ -2266,7 +2309,7 @@ mod tests {
         // client drops subscription rx
         drop(stream_rx);
 
-        // broadcast so client_loop hits try_send -> Closed
+        // send to subscriber so client_loop hits try_send -> Closed
         let msg = Message::Slot(MessageSlot {
             slot: 100,
             parent: Some(99),
@@ -2274,7 +2317,7 @@ mod tests {
             dead_error: None,
             created_at: Timestamp::from(SystemTime::now()),
         });
-        let _ = broadcast_tx.send((CommitmentLevel::Processed, Arc::new(vec![(1, msg)])));
+        let _ = test_msg_tx.send((CommitmentLevel::Processed, Arc::new(vec![(1, msg)])));
 
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
