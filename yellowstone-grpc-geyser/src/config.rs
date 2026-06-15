@@ -345,14 +345,6 @@ pub struct ConfigGrpc {
     /// If None, geyser_loop runs as a normal async tokio task with the 10ms batch timer.
     #[serde(default)]
     pub geyser_dispatch_cpu_core: Option<usize>,
-    /// CPU cores to pin the rayon encoder worker threads to (one core per worker).
-    /// Length must match encoder_threads when set. If None, workers run with OS-default affinity.
-    #[serde(default)]
-    pub encoder_cpu_cores: Option<Vec<usize>>,
-    /// CPU core to pin the encoder bridge thread to.
-    /// The bridge thread is the single coordinator that dispatches batches to the rayon pool.
-    #[serde(default)]
-    pub encoder_bridge_cpu_core: Option<usize>,
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]

@@ -8,13 +8,6 @@ use {
     tokio::sync::{mpsc, oneshot},
 };
 
-pub struct EncoderAffinity {
-    /// One CPU core index per rayon worker thread (length must equal num_threads).
-    pub worker_cores: Vec<usize>,
-    /// CPU core for the bridge thread that dispatches batches to the rayon pool.
-    pub bridge_core: Option<usize>,
-}
-
 pub struct ParallelEncoder {
     tx: mpsc::UnboundedSender<EncodeRequest>,
     pool: Arc<ThreadPool>,
@@ -26,59 +19,21 @@ struct EncodeRequest {
 }
 
 impl ParallelEncoder {
-    pub fn new(num_threads: usize, affinity: Option<EncoderAffinity>) -> (Self, std::thread::JoinHandle<()>) {
-        let (pool, bridge_core) = match affinity {
-            Some(aff) => {
-                assert_eq!(
-                    aff.worker_cores.len(),
-                    num_threads,
-                    "encoder_cpu_cores length ({}) must equal encoder_threads ({})",
-                    aff.worker_cores.len(),
-                    num_threads
-                );
-                let bridge_core = aff.bridge_core;
-                let cores = Arc::new(aff.worker_cores);
-                let pool = ThreadPoolBuilder::new()
-                    .num_threads(num_threads)
-                    .spawn_handler(move |thread| {
-                        let core = cores[thread.index()];
-                        std::thread::Builder::new()
-                            .name(format!("geyser-encoder-{}", thread.index()))
-                            .spawn(move || {
-                                if let Err(e) = crate::util::cpu_core_affinity::set_thread_affinity(&[core]) {
-                                    log::warn!("geyser-encoder-{}: failed to pin to CPU {core}: {e}", thread.index());
-                                }
-                                thread.run();
-                            })
-                            .map(|_| ())
-                    })
-                    .build()
-                    .expect("failed to create rayon pool");
-                (Arc::new(pool), bridge_core)
-            }
-            None => {
-                let pool = ThreadPoolBuilder::new()
-                    .num_threads(num_threads)
-                    .thread_name(|i| format!("geyser-encoder-{i}"))
-                    .build()
-                    .expect("failed to create rayon pool");
-                (Arc::new(pool), None)
-            }
-        };
+    pub fn new(num_threads: usize) -> (Self, std::thread::JoinHandle<()>) {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .thread_name(|i| format!("geyser-encoder-{i}"))
+                .build()
+                .expect("failed to create rayon pool"),
+        );
 
         let (tx, rx) = mpsc::unbounded_channel();
 
         let pool_for_bridge = Arc::clone(&pool);
         let handle = std::thread::Builder::new()
             .name("geyser-encoder-bridge".into())
-            .spawn(move || {
-                if let Some(core) = bridge_core {
-                    if let Err(e) = crate::util::cpu_core_affinity::set_thread_affinity(&[core]) {
-                        log::warn!("geyser-encoder-bridge: failed to pin to CPU {core}: {e}");
-                    }
-                }
-                Self::bridge_loop(rx, pool_for_bridge)
-            })
+            .spawn(move || Self::bridge_loop(rx, pool_for_bridge))
             .expect("failed to spawn encoder bridge");
 
         (Self { tx, pool }, handle)
@@ -225,7 +180,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_encoder_transactions() {
-        let (encoder, _handle) = ParallelEncoder::new(2, None);
+        let (encoder, _handle) = ParallelEncoder::new(2);
 
         let batch: Vec<(u64, Message)> = (0..10).map(|i| (i, create_test_transaction())).collect();
 
@@ -244,7 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_encoder_accounts() {
-        let (encoder, _handle) = ParallelEncoder::new(2, None);
+        let (encoder, _handle) = ParallelEncoder::new(2);
 
         let batch: Vec<(u64, Message)> = (0..10).map(|i| (i, create_test_account())).collect();
 
@@ -263,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_small_batch_uses_sync() {
-        let (encoder, _handle) = ParallelEncoder::new(2, None);
+        let (encoder, _handle) = ParallelEncoder::new(2);
 
         // Small batch < 4 should use sync path
         let batch: Vec<(u64, Message)> = (0..2).map(|i| (i, create_test_transaction())).collect();
@@ -275,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_batch() {
-        let (encoder, _handle) = ParallelEncoder::new(2, None);
+        let (encoder, _handle) = ParallelEncoder::new(2);
 
         let mut batch: Vec<(u64, Message)> = Vec::new();
         for i in 0..5 {

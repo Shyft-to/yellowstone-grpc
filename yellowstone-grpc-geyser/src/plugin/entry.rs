@@ -3,7 +3,7 @@ use {
         config::Config,
         grpc::GrpcService,
         metrics::{self, incr_geyser_event_dropped, PrometheusService},
-        parallel::{EncoderAffinity, ParallelEncoder},
+        parallel::ParallelEncoder,
         plugin::{
             filter::limits::FilterLimits,
             message::{
@@ -80,7 +80,7 @@ impl GeyserPlugin for Plugin {
     }
 
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
-        let mut config = Config::load_from_file(config_file)?;
+        let config = Config::load_from_file(config_file)?;
         let filter_limits = config.grpc.filter_limits.clone();
 
         // Setup logger
@@ -116,13 +116,7 @@ impl GeyserPlugin for Plugin {
             .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
 
         let encoder_threads = config.grpc.encoder_threads;
-        let encoder_cpu_cores = config.grpc.encoder_cpu_cores.take();
-        let encoder_bridge_cpu_core = config.grpc.encoder_bridge_cpu_core.take();
-        let encoder_affinity = encoder_cpu_cores.map(|worker_cores| EncoderAffinity {
-            worker_cores,
-            bridge_core: encoder_bridge_cpu_core,
-        });
-        let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads, encoder_affinity);
+        let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads);
 
         let result = runtime.block_on(async move {
             let (debug_client_tx, debug_client_rx) = mpsc::unbounded_channel();
