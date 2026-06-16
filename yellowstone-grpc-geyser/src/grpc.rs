@@ -819,6 +819,8 @@ impl DispatchState {
                 );
                 let encoded = encoder.encode_blocking(to_encode);
                 let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+                #[cfg(feature = "latency-metrics")]
+                crate::latency::on_batch_dispatched();
 
                 confirmed_messages.push(message.clone());
                 let _ = broadcast_tx
@@ -863,6 +865,8 @@ impl DispatchState {
                     let encoded = encoder.encode_blocking(to_encode);
                     let _ = broadcast_tx
                         .send((CommitmentLevel::Processed, encoded.into()));
+                    #[cfg(feature = "latency-metrics")]
+                    crate::latency::on_batch_dispatched();
                 }
 
                 if !confirmed_messages.is_empty() {
@@ -892,6 +896,8 @@ impl DispatchState {
             );
             let encoded = encoder.encode_blocking(to_encode);
             let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+            #[cfg(feature = "latency-metrics")]
+            crate::latency::on_batch_dispatched();
         }
     }
 
@@ -1518,6 +1524,8 @@ impl GrpcService {
             match messages_rx.try_recv() {
                 Ok(message) => {
                     metrics::message_queue_size_dec();
+                    #[cfg(feature = "latency-metrics")]
+                    crate::latency::on_message_received();
 
                     if let Message::Slot(slot_message) = &message {
                         metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
