@@ -11,19 +11,31 @@ an Executor → Evaluator agent loop on an isolated git branch, with results per
 # See current state before starting
 bash .claude/scripts/status.sh
 
-# Run the next 1 best optimization
+# Run the next 1 best optimization from candidates.md
 /project:optimize
 
 # Run the next 3 best optimizations sequentially
 /project:optimize 3
+
+# Implement any open-ended task with the 4-agent loop
+/project:implement decouple geyser_dispatch from the encoder
 ```
 
-That's it. The harness picks the next OPEN candidates by tier, implements them, evaluates
-qualitatively, retries on failure (up to 3 iterations), and logs everything.
+`/project:optimize` works from the pre-specified candidate list in `candidates.md`.
+`/project:implement` accepts any free-form task description and figures out the plan itself.
 
 ---
 
-## How it works
+## Two commands, two use cases
+
+| Command | Use when | Task source |
+|---------|----------|-------------|
+| `/project:optimize [N]` | Running pre-specified optimizations from `candidates.md` | Human-written candidate descriptions |
+| `/project:implement <task>` | Implementing any open-ended task from a description | Arbitrary natural-language request |
+
+---
+
+## `/project:optimize` — How it works
 
 ### Candidate selection
 
@@ -87,12 +99,52 @@ No PRs are opened automatically.
 
 ---
 
+## `/project:implement` — How it works
+
+The 4-agent loop for open-ended tasks:
+
+```
+/project:implement <task description>
+  │
+  ├─ [Inner loop, max 3 rounds]
+  │   ├─ PLANNER AGENT
+  │   │   • Reads arch.md + relevant source files
+  │   │   • Decomposes task into ordered sub-tasks
+  │   │   • Each sub-task: goal, files, steps, verification
+  │   │
+  │   └─ PLAN EVALUATOR AGENT
+  │       • Reads listed files (verifies paths exist)
+  │       • Generates 6-8 PASS/FAIL plan criteria
+  │       • APPROVED → proceed | NEEDS_REVISION → Planner gets feedback, loops
+  │
+  ├─ Creates git branch: impl/T<N>-<slug>
+  │
+  ├─ IMPLEMENTOR AGENT
+  │   • Executes sub-tasks in order
+  │   • After each: verify (build/test), commit
+  │   • Commit format: impl(T<N>): <sub-task> [k/total]
+  │   • Returns: implementation report
+  │
+  ├─ IMPLEMENTATION EVALUATOR AGENT
+  │   • Reads changed files + git diff
+  │   • Re-runs cargo build + cargo test
+  │   • Checks each sub-task goal + overall task goal
+  │   • PASS → done | NEEDS_REVISION → feedback goes back to Planner
+  │
+  └─ [Outer loop, max 3 cycles] — on NEEDS_REVISION, full replanning with failure context
+```
+
+State is persisted to `.claude/state/tasks/<ID>.md` and `.claude/state/tasks.jsonl`.
+
+---
+
 ## File structure
 
 ```
 .claude/
 ├── commands/
-│   └── optimize.md          # /project:optimize command (the harness)
+│   ├── optimize.md          # /project:optimize — candidate-driven optimization loop
+│   └── implement.md         # /project:implement — 4-agent loop for open-ended tasks
 ├── context/
 │   ├── candidates.md        # source of truth for optimization candidates
 │   └── arch.md              # architecture reference + ruled-out optimizations
@@ -102,7 +154,9 @@ No PRs are opened automatically.
 │   ├── parse_race.py        # parse readings2.md Triton vs New race results
 │   └── compare_bench.py     # diff two bench runs before/after
 └── state/
-    ├── experiments.jsonl    # append-only experiment log (one JSON per line)
+    ├── experiments.jsonl    # append-only log of /project:optimize runs
+    ├── tasks.jsonl          # append-only log of /project:implement runs
+    ├── tasks/               # per-task plan files (T1.md, T2.md, ...)
     └── session.md           # ephemeral per-session notes
 
 CLAUDE.md                    # auto-loaded context (short, always current)
