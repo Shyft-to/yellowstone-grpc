@@ -817,18 +817,13 @@ impl DispatchState {
                     &mut self.processed_messages,
                     Vec::with_capacity(Self::PROCESSED_MESSAGES_MAX),
                 );
-                let encoded = encoder.encode_blocking(to_encode);
-                let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                #[cfg(feature = "latency-metrics")]
-                crate::latency::on_batch_dispatched();
-
                 confirmed_messages.push(message.clone());
-                let _ = broadcast_tx
-                    .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-
                 finalized_messages.push(message);
-                let _ = broadcast_tx
-                    .send((CommitmentLevel::Finalized, finalized_messages.into()));
+                let extras = vec![
+                    (CommitmentLevel::Confirmed, confirmed_messages),
+                    (CommitmentLevel::Finalized, finalized_messages),
+                ];
+                encoder.encode_fire_and_broadcast(to_encode, extras, broadcast_tx.clone());
             } else {
                 let mut confirmed_messages = vec![];
                 let mut finalized_messages = vec![];
@@ -862,20 +857,14 @@ impl DispatchState {
                         &mut self.processed_messages,
                         Vec::with_capacity(Self::PROCESSED_MESSAGES_MAX),
                     );
-                    let encoded = encoder.encode_blocking(to_encode);
-                    let _ = broadcast_tx
-                        .send((CommitmentLevel::Processed, encoded.into()));
-                    #[cfg(feature = "latency-metrics")]
-                    crate::latency::on_batch_dispatched();
-                }
-
-                if !confirmed_messages.is_empty() {
-                    let _ = broadcast_tx
-                        .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-                }
-                if !finalized_messages.is_empty() {
-                    let _ = broadcast_tx
-                        .send((CommitmentLevel::Finalized, finalized_messages.into()));
+                    let mut extras = Vec::with_capacity(2);
+                    if !confirmed_messages.is_empty() {
+                        extras.push((CommitmentLevel::Confirmed, confirmed_messages));
+                    }
+                    if !finalized_messages.is_empty() {
+                        extras.push((CommitmentLevel::Finalized, finalized_messages));
+                    }
+                    encoder.encode_fire_and_broadcast(to_encode, extras, broadcast_tx.clone());
                 }
             }
         }
@@ -894,10 +883,7 @@ impl DispatchState {
                 &mut self.processed_messages,
                 Vec::with_capacity(Self::PROCESSED_MESSAGES_MAX),
             );
-            let encoded = encoder.encode_blocking(to_encode);
-            let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-            #[cfg(feature = "latency-metrics")]
-            crate::latency::on_batch_dispatched();
+            encoder.encode_fire_and_broadcast(to_encode, vec![], broadcast_tx.clone());
         }
     }
 
