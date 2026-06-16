@@ -67,7 +67,6 @@ use {
             IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeDeshredRequest,
             SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
         },
-        prost::Message as ProstMessage,
     },
 };
 
@@ -538,6 +537,385 @@ pub struct GrpcService {
     filter_names: Arc<Mutex<FilterNames>>,
     cancellation_token: CancellationToken,
     task_tracker: TaskTracker,
+}
+
+/// Mutable state owned exclusively by the `geyser_dispatch` spin-loop thread.
+struct DispatchState {
+    msgid_gen: MessageId,
+    messages: BTreeMap<u64, SlotMessages>,
+    processed_messages: Vec<(u64, Message)>,
+    processed_first_slot: Option<u64>,
+}
+
+impl DispatchState {
+    const PROCESSED_MESSAGES_MAX: usize = 31;
+    const FINALIZATION_SAFETY_BUFFER: u64 = 10;
+
+    fn new() -> Self {
+        Self {
+            msgid_gen: MessageId::default(),
+            messages: BTreeMap::default(),
+            processed_messages: Vec::with_capacity(Self::PROCESSED_MESSAGES_MAX),
+            processed_first_slot: None,
+        }
+    }
+
+    /// Remove slots older than the replay buffer and report any unsealed-but-finalized ones.
+    #[inline]
+    fn evict_old_slots(
+        &mut self,
+        finalized_slot: u64,
+        replay_stored_slots: u64,
+        replay_first_available_slot: &Option<Arc<AtomicU64>>,
+    ) {
+        let Some(cutoff) =
+            finalized_slot.checked_sub(Self::FINALIZATION_SAFETY_BUFFER + replay_stored_slots)
+        else {
+            return;
+        };
+        loop {
+            match self.messages.keys().next().cloned() {
+                Some(slot) if slot < cutoff => {
+                    if let Some(slot_messages) = self.messages.remove(&slot) {
+                        match self.processed_first_slot {
+                            Some(first) if slot <= first => continue,
+                            None => continue,
+                            _ => {}
+                        }
+                        if !slot_messages.sealed && slot_messages.finalized_at.is_some() {
+                            let mut reasons = vec![];
+                            if let Some(block_meta) = slot_messages.block_meta {
+                                let block_txn_count =
+                                    block_meta.executed_transaction_count as usize;
+                                let msg_txn_count = slot_messages.transactions.len();
+                                if block_txn_count != msg_txn_count {
+                                    reasons.push("InvalidTxnCount");
+                                    error!("failed to reconstruct #{slot} -- tx count: {block_txn_count} vs {msg_txn_count}");
+                                }
+                                let block_entries_count = block_meta.entries_count as usize;
+                                let msg_entries_count = slot_messages.entries.len();
+                                if block_entries_count != msg_entries_count {
+                                    reasons.push("InvalidEntriesCount");
+                                    error!("failed to reconstruct #{slot} -- entries count: {block_entries_count} vs {msg_entries_count}");
+                                }
+                            } else {
+                                reasons.push("NoBlockMeta");
+                            }
+                            metrics::update_invalid_blocks(format!(
+                                "failed reconstruct {}",
+                                reasons.join(",")
+                            ));
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let Some(stored) = replay_first_available_slot {
+            if let Some(slot) = self.messages.keys().next().copied() {
+                stored.store(slot, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Ingest one message into slot reconstruction state.
+    /// Returns `(msgid, sealed_block_msg)`.
+    #[inline]
+    fn ingest_message(&mut self, message: &Message) -> (u64, Option<(u64, Message)>) {
+        let msgid = self.msgid_gen.next();
+        let slot = message.get_slot();
+
+        if let Message::Slot(msg) = message {
+            if self.processed_first_slot.is_none() && msg.status == SlotStatus::Processed {
+                self.processed_first_slot = Some(msg.slot);
+            }
+        }
+
+        // Phase 1: update slot status flags and push message clone into slot state.
+        {
+            let slot_messages = self.messages.entry(slot).or_default();
+            if let Message::Slot(msg) = message {
+                match msg.status {
+                    SlotStatus::Processed => slot_messages.parent_slot = msg.parent,
+                    SlotStatus::Confirmed => slot_messages.confirmed = true,
+                    SlotStatus::Finalized => slot_messages.finalized = true,
+                    _ => {}
+                }
+            }
+            if matches!(message, Message::Slot(_)) {
+                slot_messages.messages_slots.push((msgid, message.clone()));
+            } else {
+                slot_messages.messages.push(Some((msgid, message.clone())));
+                if slot_messages.sealed
+                    && !(matches!(message, Message::Entry(_))
+                        && slot_messages.entries_count == 0)
+                {
+                    let kind = match message {
+                        Message::Slot(_) => "Slot",
+                        Message::Account(_) => "Account",
+                        Message::Transaction(_) => "Transaction",
+                        Message::Entry(_) => "Entry",
+                        Message::BlockMeta(_) => "BlockMeta",
+                        Message::Block(_) => "Block",
+                    };
+                    metrics::update_invalid_blocks(format!("unexpected message {kind}"));
+                }
+            }
+        }
+        // Phase 1 borrow of self.messages ends here.
+
+        // Phase 2: per-type logic that may also need self.msgid_gen (field-split borrow).
+        match message {
+            Message::BlockMeta(msg) => {
+                let slot_messages = self.messages.get_mut(&slot).expect("just inserted");
+                if slot_messages.block_meta.is_some() {
+                    metrics::update_invalid_blocks(
+                        "unexpected message: BlockMeta (duplicate)",
+                    );
+                }
+                slot_messages.block_meta = Some(Arc::clone(msg));
+                let sealed = slot_messages.try_seal(&mut self.msgid_gen);
+                (msgid, sealed)
+            }
+            Message::Transaction(msg) => {
+                let slot_messages = self.messages.get_mut(&slot).expect("just inserted");
+                slot_messages.transactions.push(Arc::clone(&msg.transaction));
+                let sealed = slot_messages.try_seal(&mut self.msgid_gen);
+                (msgid, sealed)
+            }
+            Message::Account(msg) => {
+                metrics::observe_geyser_account_update_received(msg.account.data.len());
+                let write_version = msg.account.write_version;
+                let slot_messages = self.messages.get_mut(&slot).expect("just inserted");
+                let msg_index = slot_messages.messages.len() - 1;
+                if let Some(entry) =
+                    slot_messages.accounts_dedup.get_mut(&msg.account.pubkey)
+                {
+                    if entry.0 < write_version {
+                        slot_messages.messages[entry.1] = None;
+                        *entry = (write_version, msg_index);
+                    } else {
+                        slot_messages.messages[msg_index] = None;
+                    }
+                } else {
+                    slot_messages
+                        .accounts_dedup
+                        .insert(msg.account.pubkey, (write_version, msg_index));
+                }
+                (msgid, None)
+            }
+            Message::Entry(msg) => {
+                let slot_messages = self.messages.get_mut(&slot).expect("just inserted");
+                slot_messages.entries.push(Arc::clone(msg));
+                let sealed = slot_messages.try_seal(&mut self.msgid_gen);
+                (msgid, sealed)
+            }
+            _ => (msgid, None),
+        }
+    }
+
+    /// Build the outbound messages vec, propagating commitment status to ancestor slots.
+    #[inline]
+    fn build_outbound(
+        &mut self,
+        msgid: u64,
+        message: Message,
+        sealed: Option<(u64, Message)>,
+    ) -> Vec<(u64, Message)> {
+        let slot_status = if let Message::Slot(msg) = &message {
+            Some((msg.slot, msg.status))
+        } else {
+            None
+        };
+
+        let mut messages_vec = Vec::with_capacity(4);
+        if let Some(s) = sealed {
+            messages_vec.push(s);
+        }
+        messages_vec.push((msgid, message));
+
+        if let Some((slot, status)) = slot_status {
+            let mut slots = vec![slot];
+            while let Some((parent, Some(entry))) = slots
+                .pop()
+                .and_then(|s| self.messages.get(&s))
+                .and_then(|e| e.parent_slot)
+                .map(|parent| (parent, self.messages.get_mut(&parent)))
+            {
+                if (status == SlotStatus::Confirmed && !entry.confirmed)
+                    || (status == SlotStatus::Finalized && !entry.finalized)
+                {
+                    if status == SlotStatus::Confirmed {
+                        entry.confirmed = true;
+                    } else {
+                        entry.finalized = true;
+                    }
+                    slots.push(parent);
+                    let message_slot = Message::Slot(MessageSlot {
+                        slot: parent,
+                        parent: entry.parent_slot,
+                        status,
+                        dead_error: None,
+                        created_at: Timestamp::from(SystemTime::now()),
+                    });
+                    messages_vec.push((self.msgid_gen.next(), message_slot));
+                    metrics::missed_status_message_inc(status);
+                }
+            }
+        }
+
+        messages_vec
+    }
+
+    /// Fan out messages_vec to processed / confirmed / finalized broadcast channels.
+    #[inline]
+    fn broadcast_vec(
+        &mut self,
+        messages_vec: Vec<(u64, Message)>,
+        broadcast_tx: &broadcast::Sender<BroadcastedMessage>,
+        encoder: &ParallelEncoder,
+    ) {
+        for message in messages_vec.into_iter().rev() {
+            if let Message::Slot(slot) = &message.1 {
+                let (mut confirmed_messages, mut finalized_messages) = match slot.status {
+                    SlotStatus::Processed
+                    | SlotStatus::FirstShredReceived
+                    | SlotStatus::Completed
+                    | SlotStatus::CreatedBank
+                    | SlotStatus::Dead => (Vec::with_capacity(1), Vec::with_capacity(1)),
+                    SlotStatus::Confirmed => {
+                        if let Some(sm) = self.messages.get_mut(&slot.slot) {
+                            if !sm.sealed {
+                                sm.confirmed_at = Some(sm.messages.len());
+                            }
+                        }
+                        let vec = self
+                            .messages
+                            .get(&slot.slot)
+                            .map(|sm| sm.messages.iter().flatten().cloned().collect())
+                            .unwrap_or_default();
+                        (vec, Vec::with_capacity(1))
+                    }
+                    SlotStatus::Finalized => {
+                        if let Some(sm) = self.messages.get_mut(&slot.slot) {
+                            if !sm.sealed {
+                                sm.finalized_at = Some(sm.messages.len());
+                            }
+                        }
+                        let vec = self
+                            .messages
+                            .get_mut(&slot.slot)
+                            .map(|sm| sm.messages.iter().flatten().cloned().collect())
+                            .unwrap_or_default();
+                        (Vec::with_capacity(1), vec)
+                    }
+                };
+
+                self.processed_messages.push(message.clone());
+                metrics::GEYSER_BATCH_SIZE.observe(self.processed_messages.len() as f64);
+                let to_encode = std::mem::replace(
+                    &mut self.processed_messages,
+                    Vec::with_capacity(Self::PROCESSED_MESSAGES_MAX),
+                );
+                let encoded = encoder.encode_blocking(to_encode);
+                let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+
+                confirmed_messages.push(message.clone());
+                let _ = broadcast_tx
+                    .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+
+                finalized_messages.push(message);
+                let _ = broadcast_tx
+                    .send((CommitmentLevel::Finalized, finalized_messages.into()));
+            } else {
+                let mut confirmed_messages = vec![];
+                let mut finalized_messages = vec![];
+                if matches!(&message.1, Message::Block(_)) {
+                    if let Some(sm) = self.messages.get(&message.1.get_slot()) {
+                        if let Some(confirmed_at) = sm.confirmed_at {
+                            confirmed_messages.extend(
+                                sm.messages.as_slice()[confirmed_at..]
+                                    .iter()
+                                    .filter_map(|x| x.clone()),
+                            );
+                        }
+                        if let Some(finalized_at) = sm.finalized_at {
+                            finalized_messages.extend(
+                                sm.messages.as_slice()[finalized_at..]
+                                    .iter()
+                                    .filter_map(|x| x.clone()),
+                            );
+                        }
+                    }
+                }
+
+                self.processed_messages.push(message);
+                if self.processed_messages.len() >= Self::PROCESSED_MESSAGES_MAX
+                    || !confirmed_messages.is_empty()
+                    || !finalized_messages.is_empty()
+                {
+                    metrics::GEYSER_BATCH_SIZE
+                        .observe(self.processed_messages.len() as f64);
+                    let to_encode = std::mem::replace(
+                        &mut self.processed_messages,
+                        Vec::with_capacity(Self::PROCESSED_MESSAGES_MAX),
+                    );
+                    let encoded = encoder.encode_blocking(to_encode);
+                    let _ = broadcast_tx
+                        .send((CommitmentLevel::Processed, encoded.into()));
+                }
+
+                if !confirmed_messages.is_empty() {
+                    let _ = broadcast_tx
+                        .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+                }
+                if !finalized_messages.is_empty() {
+                    let _ = broadcast_tx
+                        .send((CommitmentLevel::Finalized, finalized_messages.into()));
+                }
+            }
+        }
+    }
+
+    /// Flush any accumulated processed messages to the broadcast channel.
+    #[inline]
+    fn flush_processed(
+        &mut self,
+        broadcast_tx: &broadcast::Sender<BroadcastedMessage>,
+        encoder: &ParallelEncoder,
+    ) {
+        if !self.processed_messages.is_empty() {
+            metrics::GEYSER_BATCH_SIZE.observe(self.processed_messages.len() as f64);
+            let to_encode = std::mem::replace(
+                &mut self.processed_messages,
+                Vec::with_capacity(Self::PROCESSED_MESSAGES_MAX),
+            );
+            let encoded = encoder.encode_blocking(to_encode);
+            let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+        }
+    }
+
+    /// Collect stored messages for a replay request.
+    fn service_replay(
+        &self,
+        commitment: CommitmentLevel,
+        replay_slot: u64,
+    ) -> Vec<(u64, Message)> {
+        let mut replayed_messages = Vec::with_capacity(32_768);
+        for (slot, msgs) in self.messages.iter() {
+            if *slot >= replay_slot {
+                replayed_messages.extend_from_slice(&msgs.messages_slots);
+                if commitment == CommitmentLevel::Processed
+                    || (commitment == CommitmentLevel::Finalized && msgs.finalized)
+                    || (commitment == CommitmentLevel::Confirmed && msgs.confirmed)
+                {
+                    replayed_messages
+                        .extend(msgs.messages.iter().filter_map(|v| v.clone()));
+                }
+            }
+        }
+        replayed_messages
+    }
 }
 
 impl GrpcService {
@@ -1132,13 +1510,7 @@ impl GrpcService {
         replay_stored_slots: u64,
         parallel_encoder: ParallelEncoder,
     ) {
-        const PROCESSED_MESSAGES_MAX: usize = 31;
-        const FINALIZATION_SAFETY_BUFFER: u64 = 10;
-
-        let mut msgid_gen = MessageId::default();
-        let mut messages: BTreeMap<u64, SlotMessages> = Default::default();
-        let mut processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
-        let mut processed_first_slot = None;
+        let mut state = DispatchState::new();
         let (_dummy_tx, dummy_rx) = mpsc::channel(1);
         let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(dummy_rx);
 
@@ -1146,298 +1518,40 @@ impl GrpcService {
             match messages_rx.try_recv() {
                 Ok(message) => {
                     metrics::message_queue_size_dec();
-                    let msgid = msgid_gen.next();
 
                     if let Message::Slot(slot_message) = &message {
                         metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
+                        if slot_message.status == SlotStatus::Finalized {
+                            state.evict_old_slots(
+                                slot_message.slot,
+                                replay_stored_slots,
+                                &replay_first_available_slot,
+                            );
+                        }
                     }
-
-                    if let Some(blocks_meta_tx) = &blocks_meta_tx {
+                    if let Some(tx) = &blocks_meta_tx {
                         if matches!(&message, Message::Slot(_) | Message::BlockMeta(_)) {
-                            let _ = blocks_meta_tx.send(message.clone());
+                            let _ = tx.send(message.clone());
                         }
                     }
 
-                    match &message {
-                        Message::Slot(msg) if processed_first_slot.is_none() && msg.status == SlotStatus::Processed => {
-                            processed_first_slot = Some(msg.slot);
-                        }
-                        Message::Slot(msg) if msg.status == SlotStatus::Finalized => {
-                            if let Some(msg_slot) = msg.slot.checked_sub(FINALIZATION_SAFETY_BUFFER + replay_stored_slots) {
-                                loop {
-                                    match messages.keys().next().cloned() {
-                                        Some(slot) if slot < msg_slot => {
-                                            if let Some(slot_messages) = messages.remove(&slot) {
-                                                match processed_first_slot {
-                                                    Some(processed_first) if slot <= processed_first => continue,
-                                                    None => continue,
-                                                    _ => {}
-                                                }
-
-                                                if !slot_messages.sealed && slot_messages.finalized_at.is_some() {
-                                                    let mut reasons = vec![];
-                                                    if let Some(block_meta) = slot_messages.block_meta {
-                                                        let block_txn_count = block_meta.executed_transaction_count as usize;
-                                                        let msg_txn_count = slot_messages.transactions.len();
-                                                        if block_txn_count != msg_txn_count {
-                                                            reasons.push("InvalidTxnCount");
-                                                            error!("failed to reconstruct #{slot} -- tx count: {block_txn_count} vs {msg_txn_count}");
-                                                        }
-                                                        let block_entries_count = block_meta.entries_count as usize;
-                                                        let msg_entries_count = slot_messages.entries.len();
-                                                        if block_entries_count != msg_entries_count {
-                                                            reasons.push("InvalidEntriesCount");
-                                                            error!("failed to reconstruct #{slot} -- entries count: {block_entries_count} vs {msg_entries_count}");
-                                                        }
-                                                    } else {
-                                                        reasons.push("NoBlockMeta");
-                                                    }
-                                                    let reason = reasons.join(",");
-                                                    metrics::update_invalid_blocks(format!("failed reconstruct {reason}"));
-                                                }
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                if let Some(stored) = &replay_first_available_slot {
-                                    if let Some(slot) = messages.keys().next().copied() {
-                                        stored.store(slot, Ordering::Relaxed);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    let slot_messages = messages.entry(message.get_slot()).or_default();
-                    if let Message::Slot(msg) = &message {
-                        match msg.status {
-                            SlotStatus::Processed => {
-                                slot_messages.parent_slot = msg.parent;
-                            },
-                            SlotStatus::Confirmed => {
-                                slot_messages.confirmed = true;
-                            },
-                            SlotStatus::Finalized => {
-                                slot_messages.finalized = true;
-                            },
-                            _ => {}
-                        }
-                    }
-                    if matches!(&message, Message::Slot(_)) {
-                        slot_messages.messages_slots.push((msgid, message.clone()));
-                    } else {
-                        slot_messages.messages.push(Some((msgid, message.clone())));
-
-                        if slot_messages.sealed && !(matches!(&message, Message::Entry(_)) && slot_messages.entries_count == 0) {
-                            let kind = match &message {
-                                Message::Slot(_) => "Slot",
-                                Message::Account(_) => "Account",
-                                Message::Transaction(_) => "Transaction",
-                                Message::Entry(_) => "Entry",
-                                Message::BlockMeta(_) => "BlockMeta",
-                                Message::Block(_) => "Block",
-                            };
-                            metrics::update_invalid_blocks(format!("unexpected message {kind}"));
-                        }
-                    }
-                    let mut sealed_block_msg = None;
-                    match &message {
-                        Message::BlockMeta(msg) => {
-                            if slot_messages.block_meta.is_some() {
-                                metrics::update_invalid_blocks("unexpected message: BlockMeta (duplicate)");
-                            }
-                            slot_messages.block_meta = Some(Arc::clone(msg));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
-                        }
-                        Message::Transaction(msg) => {
-                            slot_messages.transactions.push(Arc::clone(&msg.transaction));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
-                        }
-                        Message::Account(msg) => {
-                            metrics::observe_geyser_account_update_received(msg.account.data.len());
-                            let write_version = msg.account.write_version;
-                            let msg_index = slot_messages.messages.len() - 1;
-                            if let Some(entry) = slot_messages.accounts_dedup.get_mut(&msg.account.pubkey) {
-                                if entry.0 < write_version {
-                                    slot_messages.messages[entry.1] = None;
-                                    *entry = (write_version, msg_index);
-                                } else {
-                                    slot_messages.messages[msg_index] = None;
-                                }
-                            } else {
-                                slot_messages.accounts_dedup.insert(msg.account.pubkey, (write_version, msg_index));
-                            }
-                        }
-                        Message::Entry(msg) => {
-                            slot_messages.entries.push(Arc::clone(msg));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
-                        }
-                        _ => {}
-                    }
-
-                    let mut messages_vec = Vec::with_capacity(4);
-                    if let Some(sealed_block_msg) = sealed_block_msg {
-                        messages_vec.push(sealed_block_msg);
-                    }
-                    let slot_status = if let Message::Slot(msg) = &message {
-                        Some((msg.slot, msg.status))
-                    } else {
-                        None
-                    };
-                    messages_vec.push((msgid, message));
-
-                    if let Some((slot, status)) = slot_status {
-                        let mut slots = vec![slot];
-                        while let Some((parent, Some(entry))) = slots
-                            .pop()
-                            .and_then(|slot| messages.get(&slot))
-                            .and_then(|entry| entry.parent_slot)
-                            .map(|parent| (parent, messages.get_mut(&parent)))
-                        {
-                            if (status == SlotStatus::Confirmed && !entry.confirmed) ||
-                                (status == SlotStatus::Finalized && !entry.finalized)
-                            {
-                                if status == SlotStatus::Confirmed {
-                                    entry.confirmed = true;
-                                } else if status == SlotStatus::Finalized {
-                                    entry.finalized = true;
-                                }
-
-                                slots.push(parent);
-                                let message_slot = Message::Slot(MessageSlot {
-                                    slot: parent,
-                                    parent: entry.parent_slot,
-                                    status,
-                                    dead_error: None,
-                                    created_at: Timestamp::from(SystemTime::now())
-                                });
-                                messages_vec.push((msgid_gen.next(), message_slot));
-                                metrics::missed_status_message_inc(status);
-                            }
-                        }
-                    }
-
-                    for message in messages_vec.into_iter().rev() {
-                        if let Message::Slot(slot) = &message.1 {
-                            let (mut confirmed_messages, mut finalized_messages) = match slot.status {
-                                SlotStatus::Processed | SlotStatus::FirstShredReceived | SlotStatus::Completed | SlotStatus::CreatedBank | SlotStatus::Dead => {
-                                    (Vec::with_capacity(1), Vec::with_capacity(1))
-                                }
-                                SlotStatus::Confirmed => {
-                                    if let Some(slot_messages) = messages.get_mut(&slot.slot) {
-                                        if !slot_messages.sealed {
-                                            slot_messages.confirmed_at = Some(slot_messages.messages.len());
-                                        }
-                                    }
-
-                                    let vec = messages
-                                        .get(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
-                                        .unwrap_or_default();
-                                    (vec, Vec::with_capacity(1))
-                                }
-                                SlotStatus::Finalized => {
-                                    if let Some(slot_messages) = messages.get_mut(&slot.slot) {
-                                        if !slot_messages.sealed {
-                                            slot_messages.finalized_at = Some(slot_messages.messages.len());
-                                        }
-                                    }
-
-                                    let vec = messages
-                                        .get_mut(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
-                                        .unwrap_or_default();
-                                    (Vec::with_capacity(1), vec)
-                                }
-                            };
-
-                            // processed — flush immediately on every Slot message
-                            processed_messages.push(message.clone());
-                            metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                            let encoded = parallel_encoder.encode_blocking(processed_messages);
-                            let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                            processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
-
-                            // confirmed
-                            confirmed_messages.push(message.clone());
-                            let _ = broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-
-                            // finalized
-                            finalized_messages.push(message);
-                            let _ = broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
-                        } else {
-                            let mut confirmed_messages = vec![];
-                            let mut finalized_messages = vec![];
-                            if matches!(&message.1, Message::Block(_)) {
-                                if let Some(slot_messages) = messages.get(&message.1.get_slot()) {
-                                    if let Some(confirmed_at) = slot_messages.confirmed_at {
-                                        confirmed_messages.extend(
-                                            slot_messages.messages.as_slice()[confirmed_at..].iter().filter_map(|x| x.clone())
-                                        );
-                                    }
-                                    if let Some(finalized_at) = slot_messages.finalized_at {
-                                        finalized_messages.extend(
-                                            slot_messages.messages.as_slice()[finalized_at..].iter().filter_map(|x| x.clone())
-                                        );
-                                    }
-                                }
-                            }
-
-                            processed_messages.push(message);
-                            if processed_messages.len() >= PROCESSED_MESSAGES_MAX
-                                || !confirmed_messages.is_empty()
-                                || !finalized_messages.is_empty()
-                            {
-                                metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                                let encoded = parallel_encoder.encode_blocking(processed_messages);
-                                let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                                processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
-                            }
-
-                            if !confirmed_messages.is_empty() {
-                                let _ = broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-                            }
-
-                            if !finalized_messages.is_empty() {
-                                let _ = broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
-                            }
-                        }
-                    }
+                    let (msgid, sealed) = state.ingest_message(&message);
+                    let messages_vec = state.build_outbound(msgid, message, sealed);
+                    state.broadcast_vec(messages_vec, &broadcast_tx, &parallel_encoder);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
-                    // Inbox drained — flush accumulated processed messages immediately
-                    if !processed_messages.is_empty() {
-                        metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                        let encoded = parallel_encoder.encode_blocking(processed_messages);
-                        let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                        processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
-                    }
+                    state.flush_processed(&broadcast_tx, &parallel_encoder);
 
-                    // Service any pending replay requests while idle
                     if let Ok((commitment, replay_slot, tx)) = replay_stored_slots_rx.try_recv() {
-                        if let Some((slot, _)) = messages.first_key_value() {
-                            if replay_slot < *slot {
-                                let _ = tx.send(ReplayedResponse::Lagged(*slot));
+                        if let Some((first_slot, _)) = state.messages.first_key_value() {
+                            if replay_slot < *first_slot {
+                                let _ = tx.send(ReplayedResponse::Lagged(*first_slot));
                                 std::hint::spin_loop();
                                 continue;
                             }
                         }
-
-                        let mut replayed_messages = Vec::with_capacity(32_768);
-                        for (slot, msgs) in messages.iter() {
-                            if *slot >= replay_slot {
-                                replayed_messages.extend_from_slice(&msgs.messages_slots);
-                                if commitment == CommitmentLevel::Processed
-                                    || (commitment == CommitmentLevel::Finalized && msgs.finalized)
-                                    || (commitment == CommitmentLevel::Confirmed && msgs.confirmed)
-                                {
-                                    replayed_messages.extend(msgs.messages.iter().filter_map(|v| v.clone()));
-                                }
-                            }
-                        }
-                        let _ = tx.send(ReplayedResponse::Messages(replayed_messages));
+                        let replayed = state.service_replay(commitment, replay_slot);
+                        let _ = tx.send(ReplayedResponse::Messages(replayed));
                     }
 
                     std::hint::spin_loop();
@@ -1592,11 +1706,9 @@ impl GrpcService {
                                         continue;
                                     }
                                     for message in session.filter.get_updates(message, Some(commitment)) {
-                                        let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                         match stream_tx.send(Ok(message)).await {
                                             Ok(()) => {
                                                 session.metrics.incr_message_sent();
-                                                session.metrics.incr_bytes_sent(proto_size);
                                             }
                                             Err(mpsc::error::SendError(_)) => {
                                                 error!("client #{id}: stream closed");
@@ -1641,11 +1753,9 @@ impl GrpcService {
                                 continue;
                             }
                             for message in session.filter.get_updates(message, Some(commitment)) {
-                                let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                 match stream_tx.try_send(Ok(message)) {
                                     Ok(()) => {
                                         session.metrics.incr_message_sent();
-                                        session.metrics.incr_bytes_sent(proto_size);
                                     }
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         error!("client #{id}: lagged to send an update");
