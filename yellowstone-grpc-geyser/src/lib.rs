@@ -1,5 +1,7 @@
 pub mod config;
 pub mod grpc;
+#[cfg(feature = "latency-metrics")]
+pub mod latency;
 pub mod metered;
 pub mod metrics;
 pub mod parallel;

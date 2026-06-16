@@ -89,6 +89,7 @@ required-features = ["bench"]
 
 [features]
 bench = ["dep:prost_011", "dep:solana-storage-proto"]
+latency-metrics = []
 
 [build-dependencies]
 anyhow = { workspace = true }

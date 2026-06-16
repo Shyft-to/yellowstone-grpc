@@ -344,6 +344,9 @@ impl PrometheusService {
             register!(GRPC_SERVICE_OUTBOUND_BYTES);
             register!(GEYSER_EVENT_DROPPED);
 
+            #[cfg(feature = "latency-metrics")]
+            crate::latency::register(&REGISTRY);
+
             VERSION
                 .with_label_values(&[
                     VERSION_INFO.buildts,
