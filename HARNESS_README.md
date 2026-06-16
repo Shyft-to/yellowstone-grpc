@@ -221,6 +221,110 @@ The quality of your candidate description directly determines the quality of the
 
 ---
 
+## Latency metrics
+
+The `latency-metrics` feature flag (branch `agentic_optimization`, module `src/latency.rs`) measures
+end-to-end dispatch latency in the `geyser_dispatch` spin-loop: from when a message is dequeued off
+the geyser inbox to when the `CommitmentLevel::Processed` batch is handed to the broadcast channel.
+
+### Enable at build time
+
+```bash
+# Build with latency metrics enabled
+cargo build -p yellowstone-grpc-geyser --features latency-metrics
+
+# Or in your plugin config, add the feature to the build command that produces the .so
+```
+
+When the flag is **absent** (the default), the module is not compiled in — zero overhead.
+
+### What is measured
+
+| Metric name | Type | Unit | Description |
+|-------------|------|------|-------------|
+| `geyser_dispatch_latency_us` | Histogram | microseconds | Time from `try_recv()` Ok → `broadcast_tx.send(Processed)`. Captures the oldest message in each batch. |
+
+Buckets: 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000 µs.
+
+### Expose the Prometheus endpoint
+
+Set `prometheus.address` in your plugin config (e.g. `config.toml`):
+
+```toml
+[prometheus]
+address = "0.0.0.0:9090"
+```
+
+The `/metrics` endpoint will include `geyser_dispatch_latency_us_bucket`, `_count`, and `_sum`.
+
+### Read the results
+
+```bash
+# Raw prometheus scrape
+curl -s http://localhost:9090/metrics | grep geyser_dispatch_latency
+
+# Quick summary — p50 / p99 from the histogram buckets
+curl -s http://localhost:9090/metrics | python3 - <<'EOF'
+import sys, re
+
+buckets, count, total = [], 0, 0.0
+for line in sys.stdin:
+    m = re.match(r'geyser_dispatch_latency_us_bucket\{le="([^"]+)"\} (\d+)', line)
+    if m:
+        le = float(m.group(1)) if m.group(1) != '+Inf' else float('inf')
+        buckets.append((le, int(m.group(2))))
+    m2 = re.match(r'geyser_dispatch_latency_us_count (\d+)', line)
+    if m2: count = int(m2.group(1))
+    m3 = re.match(r'geyser_dispatch_latency_us_sum ([0-9.]+)', line)
+    if m3: total = float(m3.group(1))
+
+if count:
+    mean = total / count
+    print(f"count={count}  mean={mean:.1f}µs")
+    for pct, label in [(0.50, "p50"), (0.95, "p95"), (0.99, "p99")]:
+        target = pct * count
+        for le, cum in buckets:
+            if cum >= target:
+                print(f"  {label} ≤ {le:.0f}µs")
+                break
+EOF
+```
+
+### Grafana / Prometheus scrape config
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: yellowstone_geyser
+    static_configs:
+      - targets: ['<your-node>:9090']
+```
+
+Useful PromQL queries:
+
+```promql
+# p99 dispatch latency over a 1-minute window
+histogram_quantile(0.99, rate(geyser_dispatch_latency_us_bucket[1m]))
+
+# Mean dispatch latency
+rate(geyser_dispatch_latency_us_sum[1m]) / rate(geyser_dispatch_latency_us_count[1m])
+
+# Request rate (batches/sec)
+rate(geyser_dispatch_latency_us_count[1m])
+```
+
+### Plugging into optimization branches
+
+The module is designed to be merged into any `opt/` branch without conflict — it only adds
+cfg-gated statements around the existing broadcast sends. To activate it on any branch:
+
+1. Rebase or cherry-pick commit `impl(T1): Wire latency call sites [3/3]` from branch
+   `impl/T1-first-create-a-latency-measurement-mecha` onto your target branch.
+2. Build with `--features latency-metrics`.
+3. Compare p99 before/after your optimization using the PromQL queries above.
+
+---
+
 ## Bench validation (after branch review)
 
 Once you manually review a PASS branch and merge it:
