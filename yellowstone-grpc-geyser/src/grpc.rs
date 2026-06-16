@@ -823,7 +823,11 @@ impl DispatchState {
                     (CommitmentLevel::Confirmed, confirmed_messages),
                     (CommitmentLevel::Finalized, finalized_messages),
                 ];
-                encoder.encode_fire_and_broadcast(to_encode, extras, broadcast_tx.clone());
+                #[cfg(feature = "latency-metrics")]
+                let batch_start = crate::latency::take_batch_start();
+                #[cfg(not(feature = "latency-metrics"))]
+                let batch_start: Option<std::time::Instant> = None;
+                encoder.encode_fire_and_broadcast(to_encode, extras, broadcast_tx.clone(), batch_start);
             } else {
                 let mut confirmed_messages = vec![];
                 let mut finalized_messages = vec![];
@@ -864,7 +868,11 @@ impl DispatchState {
                     if !finalized_messages.is_empty() {
                         extras.push((CommitmentLevel::Finalized, finalized_messages));
                     }
-                    encoder.encode_fire_and_broadcast(to_encode, extras, broadcast_tx.clone());
+                    #[cfg(feature = "latency-metrics")]
+                    let batch_start = crate::latency::take_batch_start();
+                    #[cfg(not(feature = "latency-metrics"))]
+                    let batch_start: Option<std::time::Instant> = None;
+                    encoder.encode_fire_and_broadcast(to_encode, extras, broadcast_tx.clone(), batch_start);
                 }
             }
         }
@@ -883,7 +891,11 @@ impl DispatchState {
                 &mut self.processed_messages,
                 Vec::with_capacity(Self::PROCESSED_MESSAGES_MAX),
             );
-            encoder.encode_fire_and_broadcast(to_encode, vec![], broadcast_tx.clone());
+            #[cfg(feature = "latency-metrics")]
+            let batch_start = crate::latency::take_batch_start();
+            #[cfg(not(feature = "latency-metrics"))]
+            let batch_start: Option<std::time::Instant> = None;
+            encoder.encode_fire_and_broadcast(to_encode, vec![], broadcast_tx.clone(), batch_start);
         }
     }
 

@@ -69,6 +69,9 @@ impl ParallelEncoder {
                     broadcast_tx,
                     batch_start,
                 } => {
+                    // batch_start is only read when latency-metrics is on; suppress the lint otherwise.
+                    #[cfg(not(feature = "latency-metrics"))]
+                    let _ = batch_start;
                     if to_encode.len() < 4 {
                         for (_, msg) in &mut to_encode {
                             Self::encode_message(msg);
