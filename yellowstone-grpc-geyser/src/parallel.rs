@@ -1,21 +1,29 @@
 use {
     crate::plugin::{
         filter::encoder::{AccountEncoder, TransactionEncoder},
-        message::Message,
+        message::{CommitmentLevel, Message},
     },
     rayon::{ThreadPool, ThreadPoolBuilder},
     std::sync::Arc,
-    tokio::sync::{mpsc, oneshot},
+    tokio::sync::{broadcast, mpsc, oneshot},
 };
 
 pub struct ParallelEncoder {
-    tx: mpsc::UnboundedSender<EncodeRequest>,
+    tx: mpsc::UnboundedSender<BridgeRequest>,
     pool: Arc<ThreadPool>,
 }
 
-struct EncodeRequest {
-    batch: Vec<(u64, Message)>,
-    response: oneshot::Sender<Vec<(u64, Message)>>,
+enum BridgeRequest {
+    EncodeAndReply {
+        batch: Vec<(u64, Message)>,
+        response: oneshot::Sender<Vec<(u64, Message)>>,
+    },
+    /// Fire-and-forget: encode `to_encode` then broadcast Processed, then broadcast each extra.
+    FireAndBroadcast {
+        to_encode: Vec<(u64, Message)>,
+        extras: Vec<(CommitmentLevel, Vec<(u64, Message)>)>,
+        broadcast_tx: broadcast::Sender<(CommitmentLevel, Arc<Vec<(u64, Message)>>)>,
+    },
 }
 
 impl ParallelEncoder {
@@ -39,22 +47,42 @@ impl ParallelEncoder {
         (Self { tx, pool }, handle)
     }
 
-    fn bridge_loop(mut rx: mpsc::UnboundedReceiver<EncodeRequest>, pool: Arc<ThreadPool>) {
+    fn bridge_loop(mut rx: mpsc::UnboundedReceiver<BridgeRequest>, pool: Arc<ThreadPool>) {
         use rayon::prelude::*;
 
         while let Some(req) = rx.blocking_recv() {
-            let EncodeRequest {
-                mut batch,
-                response,
-            } = req;
-
-            pool.install(|| {
-                batch.par_iter_mut().for_each(|(_msgid, msg)| {
-                    Self::encode_message(msg);
-                });
-            });
-
-            let _ = response.send(batch);
+            match req {
+                BridgeRequest::EncodeAndReply { mut batch, response } => {
+                    pool.install(|| {
+                        batch.par_iter_mut().for_each(|(_msgid, msg)| {
+                            Self::encode_message(msg);
+                        });
+                    });
+                    let _ = response.send(batch);
+                }
+                BridgeRequest::FireAndBroadcast {
+                    mut to_encode,
+                    extras,
+                    broadcast_tx,
+                } => {
+                    if to_encode.len() < 4 {
+                        for (_, msg) in &mut to_encode {
+                            Self::encode_message(msg);
+                        }
+                    } else {
+                        pool.install(|| {
+                            to_encode.par_iter_mut().for_each(|(_, msg)| {
+                                Self::encode_message(msg);
+                            });
+                        });
+                    }
+                    let _ = broadcast_tx
+                        .send((CommitmentLevel::Processed, Arc::new(to_encode)));
+                    for (cl, msgs) in extras {
+                        let _ = broadcast_tx.send((cl, Arc::new(msgs)));
+                    }
+                }
+            }
         }
 
         log::info!("exiting encoder bridge loop");
@@ -103,7 +131,7 @@ impl ParallelEncoder {
         // move batch, don't clone
         if self
             .tx
-            .send(EncodeRequest {
+            .send(BridgeRequest::EncodeAndReply {
                 batch,
                 response: tx,
             })
@@ -122,6 +150,23 @@ impl ParallelEncoder {
         }
         batch
     }
+
+    /// Hand a batch off to the bridge for encoding and broadcasting without blocking the caller.
+    /// The bridge will encode `to_encode`, broadcast it as Processed, then broadcast each item
+    /// in `extras` under its respective CommitmentLevel — all off the dispatch thread.
+    pub fn encode_fire_and_broadcast(
+        &self,
+        to_encode: Vec<(u64, Message)>,
+        extras: Vec<(CommitmentLevel, Vec<(u64, Message)>)>,
+        broadcast_tx: broadcast::Sender<(CommitmentLevel, Arc<Vec<(u64, Message)>>)>,
+    ) {
+        // Best-effort: if the bridge is gone we drop silently (shutdown path).
+        let _ = self.tx.send(BridgeRequest::FireAndBroadcast {
+            to_encode,
+            extras,
+            broadcast_tx,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -137,7 +182,7 @@ mod tests {
         solana_signature::Signature,
         std::{
             sync::{Arc, OnceLock},
-            time::SystemTime,
+            time::{Duration, SystemTime},
         },
     };
 
@@ -241,5 +286,65 @@ mod tests {
         let encoded = encoder.encode(batch).await;
 
         assert_eq!(encoded.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_encode_fire_and_broadcast() {
+        let (encoder, _handle) = ParallelEncoder::new(2);
+
+        let (broadcast_tx, mut rx) =
+            broadcast::channel::<(CommitmentLevel, Arc<Vec<(u64, Message)>>)>(16);
+
+        // batch of 5 transactions goes to Processed
+        let batch: Vec<(u64, Message)> = (0..5u64).map(|i| (i, create_test_transaction())).collect();
+
+        // one Confirmed item and one Finalized item as extras
+        let confirmed_item = create_test_transaction();
+        let finalized_item = create_test_account();
+        let extras = vec![
+            (CommitmentLevel::Confirmed, vec![(10u64, confirmed_item)]),
+            (CommitmentLevel::Finalized, vec![(11u64, finalized_item)]),
+        ];
+
+        encoder.encode_fire_and_broadcast(batch, extras, broadcast_tx);
+
+        // recv 1: Processed, 5 items, all pre_encoded set
+        let (cl1, msgs1) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for Processed")
+            .expect("broadcast closed");
+        assert_eq!(cl1, CommitmentLevel::Processed);
+        assert_eq!(msgs1.len(), 5);
+        for (_, msg) in msgs1.iter() {
+            if let Message::Transaction(tx) = msg {
+                assert!(
+                    tx.transaction.pre_encoded.get().is_some(),
+                    "transaction should be pre-encoded"
+                );
+            }
+        }
+
+        // recv 2: Confirmed, 1 item
+        let (cl2, msgs2) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for Confirmed")
+            .expect("broadcast closed");
+        assert_eq!(cl2, CommitmentLevel::Confirmed);
+        assert_eq!(msgs2.len(), 1);
+
+        // recv 3: Finalized, 1 item
+        let (cl3, msgs3) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for Finalized")
+            .expect("broadcast closed");
+        assert_eq!(cl3, CommitmentLevel::Finalized);
+        assert_eq!(msgs3.len(), 1);
+
+        // no 4th actual message within 100ms (channel-closed is acceptable)
+        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            Err(_elapsed) => {}                // timed out — no extra message
+            Ok(Err(_closed)) => {}             // sender dropped after last send — fine
+            Ok(Ok((cl, _))) => panic!("unexpected 4th broadcast message with level {cl:?}"),
+        }
     }
 }
