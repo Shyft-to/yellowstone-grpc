@@ -23,6 +23,9 @@ enum BridgeRequest {
         to_encode: Vec<(u64, Message)>,
         extras: Vec<(CommitmentLevel, Vec<(u64, Message)>)>,
         broadcast_tx: broadcast::Sender<(CommitmentLevel, Arc<Vec<(u64, Message)>>)>,
+        /// Batch start instant captured on the dispatch thread; used to observe latency
+        /// from the bridge thread after the Processed broadcast.
+        batch_start: Option<std::time::Instant>,
     },
 }
 
@@ -64,6 +67,7 @@ impl ParallelEncoder {
                     mut to_encode,
                     extras,
                     broadcast_tx,
+                    batch_start,
                 } => {
                     if to_encode.len() < 4 {
                         for (_, msg) in &mut to_encode {
@@ -78,6 +82,10 @@ impl ParallelEncoder {
                     }
                     let _ = broadcast_tx
                         .send((CommitmentLevel::Processed, Arc::new(to_encode)));
+                    #[cfg(feature = "latency-metrics")]
+                    if let Some(start) = batch_start {
+                        crate::latency::on_batch_dispatched_from(start);
+                    }
                     for (cl, msgs) in extras {
                         let _ = broadcast_tx.send((cl, Arc::new(msgs)));
                     }
@@ -154,17 +162,21 @@ impl ParallelEncoder {
     /// Hand a batch off to the bridge for encoding and broadcasting without blocking the caller.
     /// The bridge will encode `to_encode`, broadcast it as Processed, then broadcast each item
     /// in `extras` under its respective CommitmentLevel — all off the dispatch thread.
+    /// `batch_start` is the instant captured on the dispatch thread (from `latency::take_batch_start()`);
+    /// the bridge observes it after the Processed broadcast to record end-to-end dispatch latency.
     pub fn encode_fire_and_broadcast(
         &self,
         to_encode: Vec<(u64, Message)>,
         extras: Vec<(CommitmentLevel, Vec<(u64, Message)>)>,
         broadcast_tx: broadcast::Sender<(CommitmentLevel, Arc<Vec<(u64, Message)>>)>,
+        batch_start: Option<std::time::Instant>,
     ) {
         // Best-effort: if the bridge is gone we drop silently (shutdown path).
         let _ = self.tx.send(BridgeRequest::FireAndBroadcast {
             to_encode,
             extras,
             broadcast_tx,
+            batch_start,
         });
     }
 }
@@ -306,7 +318,7 @@ mod tests {
             (CommitmentLevel::Finalized, vec![(11u64, finalized_item)]),
         ];
 
-        encoder.encode_fire_and_broadcast(batch, extras, broadcast_tx);
+        encoder.encode_fire_and_broadcast(batch, extras, broadcast_tx, None);
 
         // recv 1: Processed, 5 items, all pre_encoded set
         let (cl1, msgs1) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
