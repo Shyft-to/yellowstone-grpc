@@ -50,3 +50,17 @@ pub fn on_batch_dispatched() {
         }
     });
 }
+
+/// Takes (reads-and-clears) the current BATCH_START from this thread's local storage.
+/// Call on the dispatch thread to capture the start instant before handing off to another thread.
+#[inline]
+pub fn take_batch_start() -> Option<Instant> {
+    BATCH_START.with(|cell| cell.take())
+}
+
+/// Observe the dispatch latency using a start instant captured on another thread.
+/// Call on the bridge thread after `broadcast_tx.send((CommitmentLevel::Processed, ...))`.
+#[inline]
+pub fn on_batch_dispatched_from(start: Instant) {
+    DISPATCH_LATENCY_US.observe(start.elapsed().as_micros() as f64);
+}
