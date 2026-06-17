@@ -696,6 +696,7 @@ impl GrpcService {
                         replay_stored_slots_rx,
                         replay_first_available_slot,
                         config.replay_stored_slots,
+                        config.processed_messages_max,
                         parallel_encoder,
                     );
                 })
@@ -709,6 +710,7 @@ impl GrpcService {
                     replay_stored_slots_rx,
                     replay_first_available_slot,
                     config.replay_stored_slots,
+                    config.processed_messages_max,
                     parallel_encoder,
                 )
                 .await;
@@ -768,9 +770,10 @@ impl GrpcService {
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
+        processed_messages_max: usize,
         parallel_encoder: ParallelEncoder,
     ) {
-        const PROCESSED_MESSAGES_MAX: usize = 31;
+        let processed_messages_max = processed_messages_max.max(1);
         const PROCESSED_MESSAGES_SLEEP: Duration = Duration::from_millis(10);
 
         /// Slots retained beyond replay buffer for parent chain status propagation
@@ -779,7 +782,7 @@ impl GrpcService {
 
         let mut msgid_gen = MessageId::default();
         let mut messages: BTreeMap<u64, SlotMessages> = Default::default();
-        let mut processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+        let mut processed_messages = Vec::with_capacity(processed_messages_max);
         let mut processed_first_slot = None;
         let processed_sleep = sleep(PROCESSED_MESSAGES_SLEEP);
         tokio::pin!(processed_sleep);
@@ -1022,7 +1025,7 @@ impl GrpcService {
                             let encoded = parallel_encoder.encode(processed_messages).await;
                             let _ =
                                 broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                            processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                            processed_messages = Vec::with_capacity(processed_messages_max);
                             processed_sleep
                                 .as_mut()
                                 .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
@@ -1055,7 +1058,7 @@ impl GrpcService {
                             }
 
                             processed_messages.push(message);
-                            if processed_messages.len() >= PROCESSED_MESSAGES_MAX
+                            if processed_messages.len() >= processed_messages_max
                                 || !confirmed_messages.is_empty()
                                 || !finalized_messages.is_empty()
                             {
@@ -1063,7 +1066,7 @@ impl GrpcService {
                                 let encoded = parallel_encoder.encode(processed_messages).await;
                                 let _ = broadcast_tx
                                     .send((CommitmentLevel::Processed, encoded.into()));
-                                processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                                processed_messages = Vec::with_capacity(processed_messages_max);
                                 processed_sleep
                                     .as_mut()
                                     .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
@@ -1086,7 +1089,7 @@ impl GrpcService {
                         metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                         let encoded = parallel_encoder.encode(processed_messages).await;
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                        processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                        processed_messages = Vec::with_capacity(processed_messages_max);
                     }
                     processed_sleep.as_mut().reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
                 }
@@ -1130,14 +1133,15 @@ impl GrpcService {
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
+        processed_messages_max: usize,
         parallel_encoder: ParallelEncoder,
     ) {
-        const PROCESSED_MESSAGES_MAX: usize = 31;
+        let processed_messages_max = processed_messages_max.max(1);
         const FINALIZATION_SAFETY_BUFFER: u64 = 10;
 
         let mut msgid_gen = MessageId::default();
         let mut messages: BTreeMap<u64, SlotMessages> = Default::default();
-        let mut processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+        let mut processed_messages = Vec::with_capacity(processed_messages_max);
         let mut processed_first_slot = None;
         let (_dummy_tx, dummy_rx) = mpsc::channel(1);
         let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(dummy_rx);
@@ -1358,7 +1362,7 @@ impl GrpcService {
                             metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                             let encoded = parallel_encoder.encode_blocking(processed_messages);
                             let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                            processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                            processed_messages = Vec::with_capacity(processed_messages_max);
 
                             // confirmed
                             confirmed_messages.push(message.clone());
@@ -1386,14 +1390,14 @@ impl GrpcService {
                             }
 
                             processed_messages.push(message);
-                            if processed_messages.len() >= PROCESSED_MESSAGES_MAX
+                            if processed_messages.len() >= processed_messages_max
                                 || !confirmed_messages.is_empty()
                                 || !finalized_messages.is_empty()
                             {
                                 metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                                 let encoded = parallel_encoder.encode_blocking(processed_messages);
                                 let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                                processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                                processed_messages = Vec::with_capacity(processed_messages_max);
                             }
 
                             if !confirmed_messages.is_empty() {
@@ -1412,7 +1416,7 @@ impl GrpcService {
                         metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                         let encoded = parallel_encoder.encode_blocking(processed_messages);
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                        processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                        processed_messages = Vec::with_capacity(processed_messages_max);
                     }
 
                     // Service any pending replay requests while idle
