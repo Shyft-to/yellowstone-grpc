@@ -686,7 +686,8 @@ impl GrpcService {
             std::thread::Builder::new()
                 .name("geyser-dispatch".into())
                 .spawn(move || {
-                    if let Err(e) = crate::util::cpu_core_affinity::set_thread_affinity(&[cpu_core]) {
+                    if let Err(e) = crate::util::cpu_core_affinity::set_thread_affinity(&[cpu_core])
+                    {
                         log::warn!("geyser-dispatch: failed to pin to CPU {cpu_core}: {e}");
                     }
                     Self::geyser_dispatch(
@@ -696,6 +697,7 @@ impl GrpcService {
                         replay_stored_slots_rx,
                         replay_first_available_slot,
                         config.replay_stored_slots,
+                        config.processed_messages_max,
                         parallel_encoder,
                     );
                 })
@@ -709,6 +711,7 @@ impl GrpcService {
                     replay_stored_slots_rx,
                     replay_first_available_slot,
                     config.replay_stored_slots,
+                    config.processed_messages_max,
                     parallel_encoder,
                 )
                 .await;
@@ -768,9 +771,10 @@ impl GrpcService {
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
+        processed_messages_max: usize,
         parallel_encoder: ParallelEncoder,
     ) {
-        const PROCESSED_MESSAGES_MAX: usize = 31;
+        let processed_messages_max = processed_messages_max.max(1);
         const PROCESSED_MESSAGES_SLEEP: Duration = Duration::from_millis(10);
 
         /// Slots retained beyond replay buffer for parent chain status propagation
@@ -779,7 +783,7 @@ impl GrpcService {
 
         let mut msgid_gen = MessageId::default();
         let mut messages: BTreeMap<u64, SlotMessages> = Default::default();
-        let mut processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+        let mut processed_messages = Vec::with_capacity(processed_messages_max);
         let mut processed_first_slot = None;
         let processed_sleep = sleep(PROCESSED_MESSAGES_SLEEP);
         tokio::pin!(processed_sleep);
@@ -812,18 +816,28 @@ impl GrpcService {
                     match &message {
                         // On startup we can receive multiple Confirmed/Finalized slots without BlockMeta message
                         // With saved first Processed slot we can ignore errors caused by startup process
-                        Message::Slot(msg) if processed_first_slot.is_none() && msg.status == SlotStatus::Processed => {
+                        Message::Slot(msg)
+                            if processed_first_slot.is_none()
+                                && msg.status == SlotStatus::Processed =>
+                        {
                             processed_first_slot = Some(msg.slot);
                         }
                         Message::Slot(msg) if msg.status == SlotStatus::Finalized => {
                             // keep extra 10 slots + slots for replay
-                            if let Some(msg_slot) = msg.slot.checked_sub(FINALIZATION_SAFETY_BUFFER + replay_stored_slots) {
+                            if let Some(msg_slot) = msg
+                                .slot
+                                .checked_sub(FINALIZATION_SAFETY_BUFFER + replay_stored_slots)
+                            {
                                 loop {
                                     match messages.keys().next().cloned() {
                                         Some(slot) if slot < msg_slot => {
                                             if let Some(slot_messages) = messages.remove(&slot) {
                                                 match processed_first_slot {
-                                                    Some(processed_first) if slot <= processed_first => continue,
+                                                    Some(processed_first)
+                                                        if slot <= processed_first =>
+                                                    {
+                                                        continue
+                                                    }
                                                     None => continue,
                                                     _ => {}
                                                 }
@@ -1022,7 +1036,7 @@ impl GrpcService {
                             let encoded = parallel_encoder.encode(processed_messages).await;
                             let _ =
                                 broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                            processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                            processed_messages = Vec::with_capacity(processed_messages_max);
                             processed_sleep
                                 .as_mut()
                                 .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
@@ -1055,7 +1069,7 @@ impl GrpcService {
                             }
 
                             processed_messages.push(message);
-                            if processed_messages.len() >= PROCESSED_MESSAGES_MAX
+                            if processed_messages.len() >= processed_messages_max
                                 || !confirmed_messages.is_empty()
                                 || !finalized_messages.is_empty()
                             {
@@ -1063,7 +1077,7 @@ impl GrpcService {
                                 let encoded = parallel_encoder.encode(processed_messages).await;
                                 let _ = broadcast_tx
                                     .send((CommitmentLevel::Processed, encoded.into()));
-                                processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                                processed_messages = Vec::with_capacity(processed_messages_max);
                                 processed_sleep
                                     .as_mut()
                                     .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
@@ -1086,7 +1100,7 @@ impl GrpcService {
                         metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                         let encoded = parallel_encoder.encode(processed_messages).await;
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                        processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                        processed_messages = Vec::with_capacity(processed_messages_max);
                     }
                     processed_sleep.as_mut().reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
                 }
@@ -1130,14 +1144,15 @@ impl GrpcService {
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
+        processed_messages_max: usize,
         parallel_encoder: ParallelEncoder,
     ) {
-        const PROCESSED_MESSAGES_MAX: usize = 31;
+        let processed_messages_max = processed_messages_max.max(1);
         const FINALIZATION_SAFETY_BUFFER: u64 = 10;
 
         let mut msgid_gen = MessageId::default();
         let mut messages: BTreeMap<u64, SlotMessages> = Default::default();
-        let mut processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+        let mut processed_messages = Vec::with_capacity(processed_messages_max);
         let mut processed_first_slot = None;
         let (_dummy_tx, dummy_rx) = mpsc::channel(1);
         let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(dummy_rx);
@@ -1159,33 +1174,53 @@ impl GrpcService {
                     }
 
                     match &message {
-                        Message::Slot(msg) if processed_first_slot.is_none() && msg.status == SlotStatus::Processed => {
+                        Message::Slot(msg)
+                            if processed_first_slot.is_none()
+                                && msg.status == SlotStatus::Processed =>
+                        {
                             processed_first_slot = Some(msg.slot);
                         }
                         Message::Slot(msg) if msg.status == SlotStatus::Finalized => {
-                            if let Some(msg_slot) = msg.slot.checked_sub(FINALIZATION_SAFETY_BUFFER + replay_stored_slots) {
+                            if let Some(msg_slot) = msg
+                                .slot
+                                .checked_sub(FINALIZATION_SAFETY_BUFFER + replay_stored_slots)
+                            {
                                 loop {
                                     match messages.keys().next().cloned() {
                                         Some(slot) if slot < msg_slot => {
                                             if let Some(slot_messages) = messages.remove(&slot) {
                                                 match processed_first_slot {
-                                                    Some(processed_first) if slot <= processed_first => continue,
+                                                    Some(processed_first)
+                                                        if slot <= processed_first =>
+                                                    {
+                                                        continue
+                                                    }
                                                     None => continue,
                                                     _ => {}
                                                 }
 
-                                                if !slot_messages.sealed && slot_messages.finalized_at.is_some() {
+                                                if !slot_messages.sealed
+                                                    && slot_messages.finalized_at.is_some()
+                                                {
                                                     let mut reasons = vec![];
-                                                    if let Some(block_meta) = slot_messages.block_meta {
-                                                        let block_txn_count = block_meta.executed_transaction_count as usize;
-                                                        let msg_txn_count = slot_messages.transactions.len();
+                                                    if let Some(block_meta) =
+                                                        slot_messages.block_meta
+                                                    {
+                                                        let block_txn_count = block_meta
+                                                            .executed_transaction_count
+                                                            as usize;
+                                                        let msg_txn_count =
+                                                            slot_messages.transactions.len();
                                                         if block_txn_count != msg_txn_count {
                                                             reasons.push("InvalidTxnCount");
                                                             error!("failed to reconstruct #{slot} -- tx count: {block_txn_count} vs {msg_txn_count}");
                                                         }
-                                                        let block_entries_count = block_meta.entries_count as usize;
-                                                        let msg_entries_count = slot_messages.entries.len();
-                                                        if block_entries_count != msg_entries_count {
+                                                        let block_entries_count =
+                                                            block_meta.entries_count as usize;
+                                                        let msg_entries_count =
+                                                            slot_messages.entries.len();
+                                                        if block_entries_count != msg_entries_count
+                                                        {
                                                             reasons.push("InvalidEntriesCount");
                                                             error!("failed to reconstruct #{slot} -- entries count: {block_entries_count} vs {msg_entries_count}");
                                                         }
@@ -1193,7 +1228,9 @@ impl GrpcService {
                                                         reasons.push("NoBlockMeta");
                                                     }
                                                     let reason = reasons.join(",");
-                                                    metrics::update_invalid_blocks(format!("failed reconstruct {reason}"));
+                                                    metrics::update_invalid_blocks(format!(
+                                                        "failed reconstruct {reason}"
+                                                    ));
                                                 }
                                             }
                                         }
@@ -1215,13 +1252,13 @@ impl GrpcService {
                         match msg.status {
                             SlotStatus::Processed => {
                                 slot_messages.parent_slot = msg.parent;
-                            },
+                            }
                             SlotStatus::Confirmed => {
                                 slot_messages.confirmed = true;
-                            },
+                            }
                             SlotStatus::Finalized => {
                                 slot_messages.finalized = true;
-                            },
+                            }
                             _ => {}
                         }
                     }
@@ -1230,7 +1267,10 @@ impl GrpcService {
                     } else {
                         slot_messages.messages.push(Some((msgid, message.clone())));
 
-                        if slot_messages.sealed && !(matches!(&message, Message::Entry(_)) && slot_messages.entries_count == 0) {
+                        if slot_messages.sealed
+                            && !(matches!(&message, Message::Entry(_))
+                                && slot_messages.entries_count == 0)
+                        {
                             let kind = match &message {
                                 Message::Slot(_) => "Slot",
                                 Message::Account(_) => "Account",
@@ -1246,20 +1286,26 @@ impl GrpcService {
                     match &message {
                         Message::BlockMeta(msg) => {
                             if slot_messages.block_meta.is_some() {
-                                metrics::update_invalid_blocks("unexpected message: BlockMeta (duplicate)");
+                                metrics::update_invalid_blocks(
+                                    "unexpected message: BlockMeta (duplicate)",
+                                );
                             }
                             slot_messages.block_meta = Some(Arc::clone(msg));
                             sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
                         }
                         Message::Transaction(msg) => {
-                            slot_messages.transactions.push(Arc::clone(&msg.transaction));
+                            slot_messages
+                                .transactions
+                                .push(Arc::clone(&msg.transaction));
                             sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
                         }
                         Message::Account(msg) => {
                             metrics::observe_geyser_account_update_received(msg.account.data.len());
                             let write_version = msg.account.write_version;
                             let msg_index = slot_messages.messages.len() - 1;
-                            if let Some(entry) = slot_messages.accounts_dedup.get_mut(&msg.account.pubkey) {
+                            if let Some(entry) =
+                                slot_messages.accounts_dedup.get_mut(&msg.account.pubkey)
+                            {
                                 if entry.0 < write_version {
                                     slot_messages.messages[entry.1] = None;
                                     *entry = (write_version, msg_index);
@@ -1267,7 +1313,9 @@ impl GrpcService {
                                     slot_messages.messages[msg_index] = None;
                                 }
                             } else {
-                                slot_messages.accounts_dedup.insert(msg.account.pubkey, (write_version, msg_index));
+                                slot_messages
+                                    .accounts_dedup
+                                    .insert(msg.account.pubkey, (write_version, msg_index));
                             }
                         }
                         Message::Entry(msg) => {
@@ -1296,8 +1344,8 @@ impl GrpcService {
                             .and_then(|entry| entry.parent_slot)
                             .map(|parent| (parent, messages.get_mut(&parent)))
                         {
-                            if (status == SlotStatus::Confirmed && !entry.confirmed) ||
-                                (status == SlotStatus::Finalized && !entry.finalized)
+                            if (status == SlotStatus::Confirmed && !entry.confirmed)
+                                || (status == SlotStatus::Finalized && !entry.finalized)
                             {
                                 if status == SlotStatus::Confirmed {
                                     entry.confirmed = true;
@@ -1311,7 +1359,7 @@ impl GrpcService {
                                     parent: entry.parent_slot,
                                     status,
                                     dead_error: None,
-                                    created_at: Timestamp::from(SystemTime::now())
+                                    created_at: Timestamp::from(SystemTime::now()),
                                 });
                                 messages_vec.push((msgid_gen.next(), message_slot));
                                 metrics::missed_status_message_inc(status);
@@ -1321,33 +1369,54 @@ impl GrpcService {
 
                     for message in messages_vec.into_iter().rev() {
                         if let Message::Slot(slot) = &message.1 {
-                            let (mut confirmed_messages, mut finalized_messages) = match slot.status {
-                                SlotStatus::Processed | SlotStatus::FirstShredReceived | SlotStatus::Completed | SlotStatus::CreatedBank | SlotStatus::Dead => {
+                            let (mut confirmed_messages, mut finalized_messages) = match slot.status
+                            {
+                                SlotStatus::Processed
+                                | SlotStatus::FirstShredReceived
+                                | SlotStatus::Completed
+                                | SlotStatus::CreatedBank
+                                | SlotStatus::Dead => {
                                     (Vec::with_capacity(1), Vec::with_capacity(1))
                                 }
                                 SlotStatus::Confirmed => {
                                     if let Some(slot_messages) = messages.get_mut(&slot.slot) {
                                         if !slot_messages.sealed {
-                                            slot_messages.confirmed_at = Some(slot_messages.messages.len());
+                                            slot_messages.confirmed_at =
+                                                Some(slot_messages.messages.len());
                                         }
                                     }
 
                                     let vec = messages
                                         .get(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
+                                        .map(|slot_messages| {
+                                            slot_messages
+                                                .messages
+                                                .iter()
+                                                .flatten()
+                                                .cloned()
+                                                .collect()
+                                        })
                                         .unwrap_or_default();
                                     (vec, Vec::with_capacity(1))
                                 }
                                 SlotStatus::Finalized => {
                                     if let Some(slot_messages) = messages.get_mut(&slot.slot) {
                                         if !slot_messages.sealed {
-                                            slot_messages.finalized_at = Some(slot_messages.messages.len());
+                                            slot_messages.finalized_at =
+                                                Some(slot_messages.messages.len());
                                         }
                                     }
 
                                     let vec = messages
                                         .get_mut(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
+                                        .map(|slot_messages| {
+                                            slot_messages
+                                                .messages
+                                                .iter()
+                                                .flatten()
+                                                .cloned()
+                                                .collect()
+                                        })
                                         .unwrap_or_default();
                                     (Vec::with_capacity(1), vec)
                                 }
@@ -1358,15 +1427,17 @@ impl GrpcService {
                             metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                             let encoded = parallel_encoder.encode_blocking(processed_messages);
                             let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                            processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                            processed_messages = Vec::with_capacity(processed_messages_max);
 
                             // confirmed
                             confirmed_messages.push(message.clone());
-                            let _ = broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+                            let _ = broadcast_tx
+                                .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
 
                             // finalized
                             finalized_messages.push(message);
-                            let _ = broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
+                            let _ = broadcast_tx
+                                .send((CommitmentLevel::Finalized, finalized_messages.into()));
                         } else {
                             let mut confirmed_messages = vec![];
                             let mut finalized_messages = vec![];
@@ -1374,34 +1445,41 @@ impl GrpcService {
                                 if let Some(slot_messages) = messages.get(&message.1.get_slot()) {
                                     if let Some(confirmed_at) = slot_messages.confirmed_at {
                                         confirmed_messages.extend(
-                                            slot_messages.messages.as_slice()[confirmed_at..].iter().filter_map(|x| x.clone())
+                                            slot_messages.messages.as_slice()[confirmed_at..]
+                                                .iter()
+                                                .filter_map(|x| x.clone()),
                                         );
                                     }
                                     if let Some(finalized_at) = slot_messages.finalized_at {
                                         finalized_messages.extend(
-                                            slot_messages.messages.as_slice()[finalized_at..].iter().filter_map(|x| x.clone())
+                                            slot_messages.messages.as_slice()[finalized_at..]
+                                                .iter()
+                                                .filter_map(|x| x.clone()),
                                         );
                                     }
                                 }
                             }
 
                             processed_messages.push(message);
-                            if processed_messages.len() >= PROCESSED_MESSAGES_MAX
+                            if processed_messages.len() >= processed_messages_max
                                 || !confirmed_messages.is_empty()
                                 || !finalized_messages.is_empty()
                             {
                                 metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                                 let encoded = parallel_encoder.encode_blocking(processed_messages);
-                                let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                                processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                                let _ =
+                                    broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
+                                processed_messages = Vec::with_capacity(processed_messages_max);
                             }
 
                             if !confirmed_messages.is_empty() {
-                                let _ = broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+                                let _ = broadcast_tx
+                                    .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
                             }
 
                             if !finalized_messages.is_empty() {
-                                let _ = broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
+                                let _ = broadcast_tx
+                                    .send((CommitmentLevel::Finalized, finalized_messages.into()));
                             }
                         }
                     }
@@ -1412,7 +1490,7 @@ impl GrpcService {
                         metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                         let encoded = parallel_encoder.encode_blocking(processed_messages);
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                        processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                        processed_messages = Vec::with_capacity(processed_messages_max);
                     }
 
                     // Service any pending replay requests while idle
@@ -1433,7 +1511,8 @@ impl GrpcService {
                                     || (commitment == CommitmentLevel::Finalized && msgs.finalized)
                                     || (commitment == CommitmentLevel::Confirmed && msgs.confirmed)
                                 {
-                                    replayed_messages.extend(msgs.messages.iter().filter_map(|v| v.clone()));
+                                    replayed_messages
+                                        .extend(msgs.messages.iter().filter_map(|v| v.clone()));
                                 }
                             }
                         }
@@ -1588,6 +1667,9 @@ impl GrpcService {
 
                                 messages.sort_by_key(|msg| msg.0);
                                 for (_msgid, message) in messages.iter() {
+                                    if !session.filter.can_match_message(message) {
+                                        continue;
+                                    }
                                     for message in session.filter.get_updates(message, Some(commitment)) {
                                         let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                         match stream_tx.send(Ok(message)).await {
@@ -1634,6 +1716,9 @@ impl GrpcService {
 
                     if commitment == session.filter.get_commitment_level() {
                         for (_msgid, message) in messages.iter() {
+                            if !session.filter.can_match_message(message) {
+                                continue;
+                            }
                             for message in session.filter.get_updates(message, Some(commitment)) {
                                 let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                 match stream_tx.try_send(Ok(message)) {
@@ -1737,6 +1822,9 @@ impl GrpcService {
                 }
             };
 
+            if !filter.can_match_message(&message) {
+                continue;
+            }
             for message in filter.get_updates(&message, None) {
                 if stream_tx.send(Ok(message)).await.is_err() {
                     error!("client #{id}: stream closed");
