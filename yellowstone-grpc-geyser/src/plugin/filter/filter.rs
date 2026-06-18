@@ -271,7 +271,7 @@ impl Filter {
         self.commitment
     }
 
-    pub fn can_match_message(&self, message: &Message) -> bool {
+    pub const fn can_match_message(&self, message: &Message) -> bool {
         let bit = match message {
             Message::Account(_) => MSG_TYPE_ACCOUNT,
             Message::Slot(_) => MSG_TYPE_SLOT,
