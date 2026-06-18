@@ -470,16 +470,47 @@ pub fn incr_geyser_event_dropped<S: AsRef<str>>(event: S) {
         .inc();
 }
 
-pub fn incr_grpc_bytes_sent<S: AsRef<str>>(remote_id: S, byte_sent: u32) {
-    GRPC_BYTES_SENT
-        .with_label_values(&[remote_id.as_ref()])
-        .inc_by(byte_sent as u64);
+/// Per-subscriber metric child handles resolved once at subscription setup so
+/// the fan-out hot path records via lock-free atomic ops on its own counter
+/// cells, instead of taking the shared `*Vec` read-lock and hashing the
+/// `subscriber_id` for a map lookup on every message (what `with_label_values`
+/// does internally). Each subscriber owns distinct label cells, so there is no
+/// cross-subscriber cache-line sharing on the increments either.
+///
+/// Replaces the former free functions `incr_grpc_message_sent_counter`,
+/// `incr_grpc_bytes_sent` and `set_subscriber_queue_size`, whose recorded series
+/// (`grpc_message_sent_count`, `grpc_bytes_sent`, `grpc_subscriber_queue_size`)
+/// are preserved unchanged.
+pub struct SubscriberMetrics {
+    grpc_message_sent: IntCounter,
+    grpc_bytes_sent: IntCounter,
+    grpc_subscriber_queue_size: IntGauge,
 }
 
-pub fn incr_grpc_message_sent_counter<S: AsRef<str>>(remote_id: S) {
-    GRPC_MESSAGE_SENT
-        .with_label_values(&[remote_id.as_ref()])
-        .inc();
+impl SubscriberMetrics {
+    pub fn new(subscriber_id: &str) -> Self {
+        Self {
+            grpc_message_sent: GRPC_MESSAGE_SENT.with_label_values(&[subscriber_id]),
+            grpc_bytes_sent: GRPC_BYTES_SENT.with_label_values(&[subscriber_id]),
+            grpc_subscriber_queue_size: GRPC_SUBSCRIBER_QUEUE_SIZE
+                .with_label_values(&[subscriber_id]),
+        }
+    }
+
+    #[inline]
+    pub fn incr_message_sent(&self) {
+        self.grpc_message_sent.inc();
+    }
+
+    #[inline]
+    pub fn incr_bytes_sent(&self, byte_sent: u32) {
+        self.grpc_bytes_sent.inc_by(byte_sent as u64);
+    }
+
+    #[inline]
+    pub fn set_queue_size(&self, size: u64) {
+        self.grpc_subscriber_queue_size.set(size as i64);
+    }
 }
 
 pub fn update_slot_status(status: &GeyserSlosStatus, slot: u64) {
@@ -555,12 +586,6 @@ pub fn set_subscriber_send_bandwidth_load<S: AsRef<str>>(subscriber_id: S, load:
         .set(load);
 }
 
-pub fn set_subscriber_queue_size<S: AsRef<str>>(subscriber_id: S, size: u64) {
-    GRPC_SUBSCRIBER_QUEUE_SIZE
-        .with_label_values(&[subscriber_id.as_ref()])
-        .set(size as i64);
-}
-
 pub fn incr_client_disconnect<S: AsRef<str>>(subscriber_id: S, reason: &str) {
     GRPC_CLIENT_DISCONNECTS
         .with_label_values(&[subscriber_id.as_ref(), reason])
@@ -581,14 +606,31 @@ pub fn incr_grpc_method_call_count<S: AsRef<str>>(method: S) {
         .inc();
 }
 
-pub fn add_grpc_service_outbound_bytes<S: AsRef<str>, P: AsRef<str>>(
-    subscriber_id: S,
-    uri_path: P,
-    bytes: u64,
-) {
-    GRPC_SERVICE_OUTBOUND_BYTES
-        .with_label_values(&[subscriber_id.as_ref(), uri_path.as_ref()])
-        .add(bytes as i64);
+/// Cached `grpc_service_outbound_bytes` gauge handle for one
+/// `(subscriber_id, uri_path)` pair, resolved once per metered response body so
+/// the per-frame hot path records via a lock-free atomic add, instead of taking
+/// the shared `IntGaugeVec` read-lock and hashing both labels for a map lookup
+/// on every body frame (what `with_label_values` does internally).
+///
+/// Replaces the former free function `add_grpc_service_outbound_bytes`; the
+/// recorded `grpc_service_outbound_bytes` series is unchanged. The cold reset on
+/// body teardown still goes through `reset_grpc_service_outbound_bytes`.
+pub struct ServiceOutboundBytes {
+    grpc_service_outbound_bytes: IntGauge,
+}
+
+impl ServiceOutboundBytes {
+    pub fn new(subscriber_id: &str, uri_path: &str) -> Self {
+        Self {
+            grpc_service_outbound_bytes: GRPC_SERVICE_OUTBOUND_BYTES
+                .with_label_values(&[subscriber_id, uri_path]),
+        }
+    }
+
+    #[inline]
+    pub fn add(&self, bytes: u64) {
+        self.grpc_service_outbound_bytes.add(bytes as i64);
+    }
 }
 
 pub fn reset_grpc_service_outbound_bytes<S: AsRef<str>, P: AsRef<str>>(

@@ -99,6 +99,13 @@ macro_rules! filtered_updates_once_ref {
     }};
 }
 
+const MSG_TYPE_ACCOUNT: u8 = 1 << 0;
+const MSG_TYPE_SLOT: u8 = 1 << 1;
+const MSG_TYPE_TRANSACTION: u8 = 1 << 2;
+const MSG_TYPE_ENTRY: u8 = 1 << 3;
+const MSG_TYPE_BLOCK: u8 = 1 << 4;
+const MSG_TYPE_BLOCKMETA: u8 = 1 << 5;
+
 #[derive(Debug, Clone)]
 pub struct Filter {
     accounts: FilterAccounts,
@@ -111,6 +118,7 @@ pub struct Filter {
     commitment: CommitmentLevel,
     accounts_data_slice: FilterAccountsDataSlice,
     ping: Option<i32>,
+    msg_type_mask: u8,
 }
 
 impl Default for Filter {
@@ -132,6 +140,7 @@ impl Default for Filter {
             commitment: CommitmentLevel::Processed,
             accounts_data_slice: FilterAccountsDataSlice::default(),
             ping: None,
+            msg_type_mask: 0,
         }
     }
 }
@@ -142,30 +151,59 @@ impl Filter {
         limits: &FilterLimits,
         names: &mut FilterNames,
     ) -> FilterResult<Self> {
+        let accounts = FilterAccounts::new(&config.accounts, &limits.accounts, names)?;
+        let slots = FilterSlots::new(&config.slots, &limits.slots, names)?;
+        let transactions = FilterTransactions::new(
+            &config.transactions,
+            &limits.transactions,
+            FilterTransactionsType::Transaction,
+            names,
+        )?;
+        let transactions_status = FilterTransactions::new(
+            &config.transactions_status,
+            &limits.transactions_status,
+            FilterTransactionsType::TransactionStatus,
+            names,
+        )?;
+        let entries = FilterEntries::new(&config.entry, &limits.entries, names)?;
+        let blocks = FilterBlocks::new(&config.blocks, &limits.blocks, names)?;
+        let blocks_meta = FilterBlocksMeta::new(&config.blocks_meta, &limits.blocks_meta, names)?;
+
+        let mut msg_type_mask = 0u8;
+        if !accounts.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_ACCOUNT;
+        }
+        if !slots.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_SLOT;
+        }
+        if !transactions.filters.is_empty() || !transactions_status.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_TRANSACTION;
+        }
+        if !entries.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_ENTRY;
+        }
+        if !blocks.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_BLOCK;
+        }
+        if !blocks_meta.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_BLOCKMETA;
+        }
+
         Ok(Self {
-            accounts: FilterAccounts::new(&config.accounts, &limits.accounts, names)?,
-            slots: FilterSlots::new(&config.slots, &limits.slots, names)?,
-            transactions: FilterTransactions::new(
-                &config.transactions,
-                &limits.transactions,
-                FilterTransactionsType::Transaction,
-                names,
-            )?,
-            transactions_status: FilterTransactions::new(
-                &config.transactions_status,
-                &limits.transactions_status,
-                FilterTransactionsType::TransactionStatus,
-                names,
-            )?,
-            entries: FilterEntries::new(&config.entry, &limits.entries, names)?,
-            blocks: FilterBlocks::new(&config.blocks, &limits.blocks, names)?,
-            blocks_meta: FilterBlocksMeta::new(&config.blocks_meta, &limits.blocks_meta, names)?,
+            accounts,
+            slots,
+            transactions,
+            transactions_status,
+            entries,
+            blocks,
+            blocks_meta,
             commitment: Self::decode_commitment(config.commitment)?,
             accounts_data_slice: FilterAccountsDataSlice::new(
                 &config.accounts_data_slice,
                 limits.accounts.data_slice_max,
             )?,
             ping: config.ping.as_ref().map(|msg| msg.id),
+            msg_type_mask,
         })
     }
 
@@ -231,6 +269,18 @@ impl Filter {
 
     pub const fn get_commitment_level(&self) -> CommitmentLevel {
         self.commitment
+    }
+
+    pub const fn can_match_message(&self, message: &Message) -> bool {
+        let bit = match message {
+            Message::Account(_) => MSG_TYPE_ACCOUNT,
+            Message::Slot(_) => MSG_TYPE_SLOT,
+            Message::Transaction(_) => MSG_TYPE_TRANSACTION,
+            Message::Entry(_) => MSG_TYPE_ENTRY,
+            Message::Block(_) => MSG_TYPE_BLOCK,
+            Message::BlockMeta(_) => MSG_TYPE_BLOCKMETA,
+        };
+        self.msg_type_mask & bit != 0
     }
 
     pub fn get_updates(

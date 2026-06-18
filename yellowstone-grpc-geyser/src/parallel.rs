@@ -4,11 +4,13 @@ use {
         message::Message,
     },
     rayon::{ThreadPool, ThreadPoolBuilder},
+    std::sync::Arc,
     tokio::sync::{mpsc, oneshot},
 };
 
 pub struct ParallelEncoder {
     tx: mpsc::UnboundedSender<EncodeRequest>,
+    pool: Arc<ThreadPool>,
 }
 
 struct EncodeRequest {
@@ -18,23 +20,26 @@ struct EncodeRequest {
 
 impl ParallelEncoder {
     pub fn new(num_threads: usize) -> (Self, std::thread::JoinHandle<()>) {
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .thread_name(|i| format!("geyser-encoder-{i}"))
-            .build()
-            .expect("failed to create rayon pool");
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .thread_name(|i| format!("geyser-encoder-{i}"))
+                .build()
+                .expect("failed to create rayon pool"),
+        );
 
         let (tx, rx) = mpsc::unbounded_channel();
 
+        let pool_for_bridge = Arc::clone(&pool);
         let handle = std::thread::Builder::new()
             .name("geyser-encoder-bridge".into())
-            .spawn(move || Self::bridge_loop(rx, pool))
+            .spawn(move || Self::bridge_loop(rx, pool_for_bridge))
             .expect("failed to spawn encoder bridge");
 
-        (Self { tx }, handle)
+        (Self { tx, pool }, handle)
     }
 
-    fn bridge_loop(mut rx: mpsc::UnboundedReceiver<EncodeRequest>, pool: ThreadPool) {
+    fn bridge_loop(mut rx: mpsc::UnboundedReceiver<EncodeRequest>, pool: Arc<ThreadPool>) {
         use rayon::prelude::*;
 
         while let Some(req) = rx.blocking_recv() {
@@ -53,6 +58,23 @@ impl ParallelEncoder {
         }
 
         log::info!("exiting encoder bridge loop");
+    }
+
+    pub fn encode_blocking(&self, mut batch: Vec<(u64, Message)>) -> Vec<(u64, Message)> {
+        use rayon::prelude::*;
+
+        if batch.len() < 4 {
+            for (_, msg) in &mut batch {
+                Self::encode_message(msg);
+            }
+        } else {
+            self.pool.install(|| {
+                batch
+                    .par_iter_mut()
+                    .for_each(|(_, msg)| Self::encode_message(msg));
+            });
+        }
+        batch
     }
 
     fn encode_message(msg: &Message) {

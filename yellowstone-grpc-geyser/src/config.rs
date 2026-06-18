@@ -341,6 +341,16 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub encoder_threads: usize,
+    /// Maximum number of messages accumulated into one encoded batch before flushing.
+    #[serde(
+        default = "ConfigGrpc::processed_messages_max_default",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub processed_messages_max: usize,
+    /// CPU core to pin the geyser dispatch thread to (enables busy-poll spin loop).
+    /// If None, geyser_loop runs as a normal async tokio task with the 10ms batch timer.
+    #[serde(default)]
+    pub geyser_dispatch_cpu_core: Option<usize>,
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]
@@ -403,6 +413,10 @@ impl ConfigGrpc {
 
     const fn encoder_threads_default() -> usize {
         4
+    }
+
+    const fn processed_messages_max_default() -> usize {
+        31
     }
 }
 
