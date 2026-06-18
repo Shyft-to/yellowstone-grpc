@@ -99,12 +99,12 @@ macro_rules! filtered_updates_once_ref {
     }};
 }
 
-const MSG_TYPE_ACCOUNT: u8     = 1 << 0;
-const MSG_TYPE_SLOT: u8        = 1 << 1;
+const MSG_TYPE_ACCOUNT: u8 = 1 << 0;
+const MSG_TYPE_SLOT: u8 = 1 << 1;
 const MSG_TYPE_TRANSACTION: u8 = 1 << 2;
-const MSG_TYPE_ENTRY: u8       = 1 << 3;
-const MSG_TYPE_BLOCK: u8       = 1 << 4;
-const MSG_TYPE_BLOCKMETA: u8   = 1 << 5;
+const MSG_TYPE_ENTRY: u8 = 1 << 3;
+const MSG_TYPE_BLOCK: u8 = 1 << 4;
+const MSG_TYPE_BLOCKMETA: u8 = 1 << 5;
 
 #[derive(Debug, Clone)]
 pub struct Filter {
@@ -170,12 +170,24 @@ impl Filter {
         let blocks_meta = FilterBlocksMeta::new(&config.blocks_meta, &limits.blocks_meta, names)?;
 
         let mut msg_type_mask = 0u8;
-        if !accounts.filters.is_empty() { msg_type_mask |= MSG_TYPE_ACCOUNT; }
-        if !slots.filters.is_empty() { msg_type_mask |= MSG_TYPE_SLOT; }
-        if !transactions.filters.is_empty() || !transactions_status.filters.is_empty() { msg_type_mask |= MSG_TYPE_TRANSACTION; }
-        if !entries.filters.is_empty() { msg_type_mask |= MSG_TYPE_ENTRY; }
-        if !blocks.filters.is_empty() { msg_type_mask |= MSG_TYPE_BLOCK; }
-        if !blocks_meta.filters.is_empty() { msg_type_mask |= MSG_TYPE_BLOCKMETA; }
+        if !accounts.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_ACCOUNT;
+        }
+        if !slots.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_SLOT;
+        }
+        if !transactions.filters.is_empty() || !transactions_status.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_TRANSACTION;
+        }
+        if !entries.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_ENTRY;
+        }
+        if !blocks.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_BLOCK;
+        }
+        if !blocks_meta.filters.is_empty() {
+            msg_type_mask |= MSG_TYPE_BLOCKMETA;
+        }
 
         Ok(Self {
             accounts,
