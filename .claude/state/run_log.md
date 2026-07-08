@@ -163,7 +163,7 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 ## Task Progress
 | # | Task | Status | Attempts | Last Verdict | Commit |
 |---|------|--------|----------|---------------|--------|
-| 1 | Remove ParallelEncoder, direct synchronous encode_messages() | IN_PROGRESS | 1 | REJECTED | - |
+| 1 | Remove ParallelEncoder, direct synchronous encode_messages() | IN_PROGRESS | 2 | REJECTED (attempt 1) | - |
 | 2 | jemalloc as global allocator | PENDING | 0 | - | - |
 | 3 | Filter foldhash + per-connection FilterNames | PENDING | 0 | - | - |
 | 4 | Characterization tests (regression net, test-only) | PENDING | 0 | - | - |
