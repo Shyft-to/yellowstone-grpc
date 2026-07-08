@@ -2426,4 +2426,636 @@ mod tests {
         // drop fires but "UNKNOWN" was never in the tracker, so nothing changes
         assert!(tracker.lock().unwrap().is_empty());
     }
+
+    // Characterization tests for the block-reconstruction bookkeeping shared
+    // by `geyser_dispatch` (CPU-pinned spin loop) and `geyser_loop` (async
+    // fallback). These establish the *current* behavior of both functions as
+    // a regression net for a future mechanical extraction/thread-split of
+    // that bookkeeping: every test below is run against both implementations
+    // via `DispatchKind`.
+    mod geyser_bookkeeping {
+        use {
+            super::*,
+            bytes::Bytes,
+            crate::plugin::message::{
+                MessageAccount, MessageAccountInfo, MessageTransaction, MessageTransactionInfo,
+            },
+            solana_hash::Hash,
+            solana_signature::Signature,
+            std::{collections::HashSet, sync::OnceLock},
+            yellowstone_grpc_proto::{geyser::SubscribeUpdateBlockMeta, solana::storage::confirmed_block},
+        };
+
+        fn unique_signature(seed: u64) -> Signature {
+            let mut bytes = [0u8; 64];
+            bytes[..8].copy_from_slice(&seed.to_le_bytes());
+            Signature::from(bytes)
+        }
+
+        #[derive(Clone, Copy)]
+        enum DispatchKind {
+            Loop,
+            Dispatch,
+        }
+
+        /// Spawns either `geyser_loop` (on the current tokio runtime) or
+        /// `geyser_dispatch` (on a dedicated OS thread, mirroring how
+        /// `GrpcService::create` wires it for CPU-pinned deployments) and
+        /// returns the channels needed to drive and observe it.
+        fn spawn_dispatch(
+            kind: DispatchKind,
+            replay_stored_slots: u64,
+            processed_messages_max: usize,
+        ) -> (
+            mpsc::UnboundedSender<Message>,
+            broadcast::Sender<BroadcastedMessage>,
+            mpsc::Sender<ReplayStoredSlotsRequest>,
+            Arc<AtomicU64>,
+        ) {
+            let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+            let (broadcast_tx, _rx) = broadcast::channel(1024);
+            let (replay_tx, replay_rx) = mpsc::channel(8);
+            let replay_first_available_slot = Arc::new(AtomicU64::new(u64::MAX));
+
+            let broadcast_tx_bg = broadcast_tx.clone();
+            let replay_slot_bg = Arc::clone(&replay_first_available_slot);
+
+            match kind {
+                DispatchKind::Loop => {
+                    tokio::spawn(GrpcService::geyser_loop(
+                        messages_rx,
+                        None,
+                        broadcast_tx_bg,
+                        Some(replay_rx),
+                        Some(replay_slot_bg),
+                        replay_stored_slots,
+                        processed_messages_max,
+                    ));
+                }
+                DispatchKind::Dispatch => {
+                    std::thread::spawn(move || {
+                        GrpcService::geyser_dispatch(
+                            messages_rx,
+                            None,
+                            broadcast_tx_bg,
+                            Some(replay_rx),
+                            Some(replay_slot_bg),
+                            replay_stored_slots,
+                            processed_messages_max,
+                        );
+                    });
+                }
+            }
+
+            (messages_tx, broadcast_tx, replay_tx, replay_first_available_slot)
+        }
+
+        async fn recv_broadcast(
+            rx: &mut broadcast::Receiver<BroadcastedMessage>,
+        ) -> BroadcastedMessage {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out waiting for a broadcast")
+                .expect("broadcast channel closed unexpectedly")
+        }
+
+        async fn try_recv_broadcast(
+            rx: &mut broadcast::Receiver<BroadcastedMessage>,
+            timeout: Duration,
+        ) -> Option<BroadcastedMessage> {
+            tokio::time::timeout(timeout, rx.recv())
+                .await
+                .ok()
+                .map(|res| res.expect("broadcast channel closed unexpectedly"))
+        }
+
+        fn make_slot(slot: u64, parent: Option<u64>, status: SlotStatus) -> Message {
+            Message::Slot(MessageSlot {
+                slot,
+                parent,
+                status,
+                dead_error: None,
+                created_at: Timestamp::from(SystemTime::now()),
+            })
+        }
+
+        fn make_account(slot: u64, pubkey: Pubkey, write_version: u64) -> Message {
+            Message::Account(MessageAccount {
+                account: Arc::new(MessageAccountInfo {
+                    pubkey,
+                    lamports: 0,
+                    owner: Pubkey::default(),
+                    executable: false,
+                    rent_epoch: 0,
+                    data: Bytes::new(),
+                    write_version,
+                    txn_signature: None,
+                    pre_encoded: OnceLock::new(),
+                }),
+                slot,
+                is_startup: false,
+                created_at: Timestamp::from(SystemTime::now()),
+            })
+        }
+
+        fn make_transaction(slot: u64, signature: Signature) -> Message {
+            Message::Transaction(MessageTransaction {
+                transaction: Arc::new(MessageTransactionInfo {
+                    signature,
+                    is_vote: false,
+                    transaction: confirmed_block::Transaction::default(),
+                    meta: confirmed_block::TransactionStatusMeta::default(),
+                    index: 0,
+                    account_keys: HashSet::new(),
+                    pre_encoded: OnceLock::new(),
+                }),
+                slot,
+                created_at: Timestamp::from(SystemTime::now()),
+            })
+        }
+
+        fn make_entry(slot: u64, index: usize) -> Message {
+            Message::Entry(Arc::new(MessageEntry {
+                slot,
+                index,
+                num_hashes: 0,
+                hash: Hash::default(),
+                executed_transaction_count: 0,
+                starting_transaction_index: 0,
+                created_at: Timestamp::from(SystemTime::now()),
+            }))
+        }
+
+        fn make_block_meta(slot: u64, executed_transaction_count: u64, entries_count: u64) -> Message {
+            Message::BlockMeta(Arc::new(MessageBlockMeta {
+                block_meta: SubscribeUpdateBlockMeta {
+                    slot,
+                    blockhash: format!("hash-{slot}"),
+                    rewards: None,
+                    block_time: None,
+                    block_height: None,
+                    parent_slot: slot.saturating_sub(1),
+                    parent_blockhash: String::new(),
+                    executed_transaction_count,
+                    entries_count,
+                },
+                created_at: Timestamp::from(SystemTime::now()),
+            }))
+        }
+
+        // --- 1. Dedup by write_version ------------------------------------
+
+        async fn run_dedup_by_write_version(kind: DispatchKind) {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot) = spawn_dispatch(kind, 100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            let pubkey = Pubkey::new_unique();
+            tx.send(make_account(10, pubkey, 5)).unwrap();
+            tx.send(make_account(10, pubkey, 2)).unwrap();
+            tx.send(make_slot(10, None, SlotStatus::Confirmed)).unwrap();
+
+            loop {
+                let (commitment, batch) = recv_broadcast(&mut rx).await;
+                if commitment != CommitmentLevel::Confirmed {
+                    continue;
+                }
+                let write_versions: Vec<_> = batch
+                    .iter()
+                    .filter_map(|(_, m)| match m {
+                        Message::Account(a) => Some(a.account.write_version),
+                        _ => None,
+                    })
+                    .collect();
+                if !write_versions.is_empty() {
+                    assert_eq!(
+                        write_versions,
+                        vec![5],
+                        "only the higher write_version account update should survive dedup"
+                    );
+                    break;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_dedup_by_write_version_loop() {
+            run_dedup_by_write_version(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_dedup_by_write_version_dispatch() {
+            run_dedup_by_write_version(DispatchKind::Dispatch).await;
+        }
+
+        // --- 2. Block sealing gating ---------------------------------------
+
+        async fn run_block_seal_on_matching_counts(kind: DispatchKind) {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot) = spawn_dispatch(kind, 100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            tx.send(make_block_meta(50, 1, 1)).unwrap();
+            tx.send(make_transaction(50, unique_signature(1))).unwrap();
+            tx.send(make_entry(50, 0)).unwrap();
+
+            let mut saw_block = false;
+            for _ in 0..10 {
+                let (commitment, batch) = recv_broadcast(&mut rx).await;
+                if commitment != CommitmentLevel::Processed {
+                    continue;
+                }
+                if batch.iter().any(|(_, m)| matches!(m, Message::Block(_))) {
+                    saw_block = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_block,
+                "a sealed Block message should be produced once tx and entry counts match block_meta"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_block_seal_on_matching_counts_loop() {
+            run_block_seal_on_matching_counts(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_block_seal_on_matching_counts_dispatch() {
+            run_block_seal_on_matching_counts(DispatchKind::Dispatch).await;
+        }
+
+        async fn run_block_seal_gated_by_mismatched_counts(kind: DispatchKind) {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot) = spawn_dispatch(kind, 100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            // entries_count == 0 takes the "no entries expected" branch, so
+            // only the transaction count can mismatch here.
+            tx.send(make_block_meta(60, 2, 0)).unwrap();
+            tx.send(make_transaction(60, unique_signature(2))).unwrap();
+
+            for _ in 0..2 {
+                let (commitment, batch) = recv_broadcast(&mut rx).await;
+                assert_eq!(commitment, CommitmentLevel::Processed);
+                assert!(!batch.iter().any(|(_, m)| matches!(m, Message::Block(_))));
+            }
+
+            let extra = try_recv_broadcast(&mut rx, Duration::from_millis(250)).await;
+            assert!(
+                extra.is_none(),
+                "no Block message should ever be produced while tx count ({}) != executed_transaction_count (2), got {extra:?}",
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn test_block_seal_gated_by_mismatched_counts_loop() {
+            run_block_seal_gated_by_mismatched_counts(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_block_seal_gated_by_mismatched_counts_dispatch() {
+            run_block_seal_gated_by_mismatched_counts(DispatchKind::Dispatch).await;
+        }
+
+        // --- 3. Duplicate BlockMeta detection -------------------------------
+        //
+        // Today's code does not reject a duplicate BlockMeta for a slot: it
+        // logs an "unexpected message: BlockMeta (duplicate)" invalid-block
+        // metric (not observable here without a real Prometheus registry) and
+        // unconditionally overwrites the stored block_meta with the new one.
+        // This test documents that overwrite behavior and confirms it does
+        // not panic or corrupt bookkeeping for the slot.
+
+        async fn run_duplicate_block_meta_overwrites(kind: DispatchKind) {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot) = spawn_dispatch(kind, 100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            tx.send(make_block_meta(70, 1, 0)).unwrap(); // first: wrong count
+            tx.send(make_block_meta(70, 2, 0)).unwrap(); // duplicate: correct count
+            tx.send(make_transaction(70, unique_signature(3)))
+                .unwrap();
+            tx.send(make_transaction(70, unique_signature(4)))
+                .unwrap();
+
+            let mut saw_block = false;
+            for _ in 0..10 {
+                let (commitment, batch) = recv_broadcast(&mut rx).await;
+                if commitment != CommitmentLevel::Processed {
+                    continue;
+                }
+                if let Some((_, Message::Block(block))) =
+                    batch.iter().find(|(_, m)| matches!(m, Message::Block(_)))
+                {
+                    assert_eq!(
+                        block.meta.executed_transaction_count, 2,
+                        "sealed block should reflect the second (duplicate) BlockMeta, not the first"
+                    );
+                    saw_block = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_block,
+                "block should still seal (using the most recently stored BlockMeta) after a duplicate arrives, without panicking"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_duplicate_block_meta_overwrites_loop() {
+            run_duplicate_block_meta_overwrites(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_duplicate_block_meta_overwrites_dispatch() {
+            run_duplicate_block_meta_overwrites(DispatchKind::Dispatch).await;
+        }
+
+        // --- 4. Missed-status parent-slot propagation -----------------------
+
+        async fn run_missed_status_backfill(kind: DispatchKind) {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot) = spawn_dispatch(kind, 100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            tx.send(make_slot(100, None, SlotStatus::Processed)).unwrap();
+            tx.send(make_slot(101, Some(100), SlotStatus::Processed))
+                .unwrap();
+            tx.send(make_slot(102, Some(101), SlotStatus::Processed))
+                .unwrap();
+            // slot 102 gets Confirmed directly; 100 and 101 never receive
+            // their own Confirmed status message.
+            tx.send(make_slot(102, Some(101), SlotStatus::Confirmed))
+                .unwrap();
+
+            let mut confirmed_slots = Vec::new();
+            for _ in 0..20 {
+                let (commitment, batch) = recv_broadcast(&mut rx).await;
+                if commitment != CommitmentLevel::Confirmed {
+                    continue;
+                }
+                for (_, m) in batch.iter() {
+                    // Note: every raw Slot message (any status) is also
+                    // broadcast once under CommitmentLevel::Confirmed with
+                    // itself as the sole entry (see the unconditional
+                    // `confirmed_messages.push(message.clone())` below). We
+                    // only care about messages whose *own* status is
+                    // Confirmed, i.e. the real backfilled/synthesized ones.
+                    if let Message::Slot(s) = m {
+                        if s.status == SlotStatus::Confirmed {
+                            confirmed_slots.push(s.slot);
+                        }
+                    }
+                }
+                if confirmed_slots.contains(&100) && confirmed_slots.contains(&101) {
+                    break;
+                }
+            }
+
+            assert!(
+                confirmed_slots.contains(&100),
+                "ancestor slot 100 should get a synthesized Confirmed status backfilled from slot 102"
+            );
+            assert!(
+                confirmed_slots.contains(&101),
+                "ancestor slot 101 should get a synthesized Confirmed status backfilled from slot 102"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_missed_status_backfill_loop() {
+            run_missed_status_backfill(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_missed_status_backfill_dispatch() {
+            run_missed_status_backfill(DispatchKind::Dispatch).await;
+        }
+
+        // --- 5. Gc timing ----------------------------------------------------
+
+        async fn run_gc_retains_until_safety_buffer(kind: DispatchKind) {
+            // Mirrors the `FINALIZATION_SAFETY_BUFFER` constant inlined in
+            // both `geyser_loop` and `geyser_dispatch`.
+            const FINALIZATION_SAFETY_BUFFER: u64 = 10;
+            let replay_stored_slots = 5u64;
+
+            let (tx, broadcast_tx, _replay_tx, replay_first_available_slot) =
+                spawn_dispatch(kind, replay_stored_slots, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            for slot in 1..=30u64 {
+                tx.send(make_account(slot, Pubkey::new_unique(), 1))
+                    .unwrap();
+            }
+            tx.send(make_slot(30, Some(29), SlotStatus::Finalized))
+                .unwrap();
+
+            // Wait until slot 30's Finalized message has been fully processed
+            // (gc runs synchronously before any broadcast for that message).
+            loop {
+                let (_commitment, batch) = recv_broadcast(&mut rx).await;
+                if batch.iter().any(|(_, m)| {
+                    matches!(m, Message::Slot(s) if s.slot == 30 && s.status == SlotStatus::Finalized)
+                }) {
+                    break;
+                }
+            }
+
+            let expected_earliest = 30 - (FINALIZATION_SAFETY_BUFFER + replay_stored_slots);
+            assert_eq!(
+                replay_first_available_slot.load(Ordering::Relaxed),
+                expected_earliest,
+                "earliest surviving slot should be exactly FINALIZATION_SAFETY_BUFFER + replay_stored_slots \
+                 behind the finalized slot: not gc'd before that boundary, not retained past it"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_gc_retains_until_safety_buffer_loop() {
+            run_gc_retains_until_safety_buffer(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_gc_retains_until_safety_buffer_dispatch() {
+            run_gc_retains_until_safety_buffer(DispatchKind::Dispatch).await;
+        }
+
+        // --- 6. Replay-buffer servicing ---------------------------------------
+
+        async fn run_replay_buffer_servicing(kind: DispatchKind) {
+            let (tx, broadcast_tx, replay_tx, _replay_slot) = spawn_dispatch(kind, 1000, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            for slot in 10..=15u64 {
+                tx.send(make_slot(slot, Some(slot.saturating_sub(1)), SlotStatus::Processed))
+                    .unwrap();
+            }
+
+            // Wait for the last slot message to be processed before issuing
+            // the replay request, to avoid racing the dispatcher's bookkeeping.
+            loop {
+                let (_commitment, batch) = recv_broadcast(&mut rx).await;
+                if batch
+                    .iter()
+                    .any(|(_, m)| matches!(m, Message::Slot(s) if s.slot == 15))
+                {
+                    break;
+                }
+            }
+
+            // In-range request: from_slot within the retained buffer.
+            let (resp_tx, resp_rx) = oneshot::channel();
+            replay_tx
+                .send((CommitmentLevel::Processed, 12, resp_tx))
+                .await
+                .unwrap();
+            match resp_rx.await.unwrap() {
+                ReplayedResponse::Messages(messages) => {
+                    let slots: Vec<_> = messages
+                        .iter()
+                        .filter_map(|(_, m)| match m {
+                            Message::Slot(s) => Some(s.slot),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(slots, vec![12, 13, 14, 15]);
+                }
+                ReplayedResponse::Lagged(slot) => {
+                    panic!("expected in-range replay messages, got Lagged({slot})")
+                }
+            }
+
+            // Out-of-range request: from_slot below the earliest stored slot.
+            let (resp_tx2, resp_rx2) = oneshot::channel();
+            replay_tx
+                .send((CommitmentLevel::Processed, 5, resp_tx2))
+                .await
+                .unwrap();
+            match resp_rx2.await.unwrap() {
+                ReplayedResponse::Lagged(earliest) => assert_eq!(earliest, 10),
+                ReplayedResponse::Messages(_) => {
+                    panic!("expected a Lagged response for an out-of-range from_slot")
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_replay_buffer_servicing_loop() {
+            run_replay_buffer_servicing(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_replay_buffer_servicing_dispatch() {
+            run_replay_buffer_servicing(DispatchKind::Dispatch).await;
+        }
+
+        // --- 7a. Live ordering: no backfill ----------------------------------
+
+        async fn run_live_ordering_no_backfill(kind: DispatchKind) {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot) = spawn_dispatch(kind, 100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            let pubkey_a = Pubkey::new_unique();
+            let pubkey_b = Pubkey::new_unique();
+            tx.send(make_account(200, pubkey_a, 1)).unwrap();
+            tx.send(make_account(200, pubkey_b, 1)).unwrap();
+            tx.send(make_transaction(200, unique_signature(5)))
+                .unwrap();
+
+            let mut msgids = Vec::new();
+            for _ in 0..3 {
+                let (commitment, batch) = recv_broadcast(&mut rx).await;
+                assert_eq!(commitment, CommitmentLevel::Processed);
+                for (msgid, _) in batch.iter() {
+                    msgids.push(*msgid);
+                }
+            }
+
+            assert!(
+                msgids.windows(2).all(|w| w[0] < w[1]),
+                "live Processed messages should arrive in strictly increasing msgid order \
+                 when no missed-status backfill occurs, got {msgids:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_live_ordering_no_backfill_loop() {
+            run_live_ordering_no_backfill(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_live_ordering_no_backfill_dispatch() {
+            run_live_ordering_no_backfill(DispatchKind::Dispatch).await;
+        }
+
+        // --- 7b. Live ordering: backfill case ---------------------------------
+        //
+        // Verified against the current source (not assumed): the backfill
+        // loop appends synthesized ancestor messages to `messages_vec` in
+        // ancestor order (closest ancestor first), assigning each a fresh,
+        // increasing msgid as it goes. That vector is then broadcast via
+        // `messages_vec.into_iter().rev()`, so the *last*-synthesized (and
+        // therefore highest-msgid, oldest-ancestor) message is broadcast
+        // *first*. Today's code therefore broadcasts backfilled ancestors in
+        // msgid-decreasing order relative to each other and to the slot that
+        // triggered them.
+
+        async fn run_live_ordering_backfill(kind: DispatchKind) {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot) = spawn_dispatch(kind, 100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            tx.send(make_slot(300, None, SlotStatus::Processed)).unwrap();
+            tx.send(make_slot(301, Some(300), SlotStatus::Processed))
+                .unwrap();
+            tx.send(make_slot(302, Some(301), SlotStatus::Processed))
+                .unwrap();
+            tx.send(make_slot(302, Some(301), SlotStatus::Confirmed))
+                .unwrap();
+
+            let mut seen: Vec<(u64, u64)> = Vec::new(); // (msgid, slot)
+            for _ in 0..20 {
+                let (commitment, batch) = recv_broadcast(&mut rx).await;
+                if commitment != CommitmentLevel::Confirmed {
+                    continue;
+                }
+                for (msgid, m) in batch.iter() {
+                    // As in the previous test: only messages whose own
+                    // status is Confirmed are the real (raw or backfilled)
+                    // Confirmed status updates; every raw Slot message also
+                    // gets an (uninteresting, single-item) broadcast on this
+                    // channel regardless of its own status.
+                    if let Message::Slot(s) = m {
+                        if s.status == SlotStatus::Confirmed && [300, 301, 302].contains(&s.slot) {
+                            seen.push((*msgid, s.slot));
+                        }
+                    }
+                }
+                let slots: Vec<_> = seen.iter().map(|(_, s)| *s).collect();
+                if slots.contains(&300) && slots.contains(&301) && slots.contains(&302) {
+                    break;
+                }
+            }
+
+            assert_eq!(
+                seen.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+                vec![300, 301, 302],
+                "oldest backfilled ancestor should be broadcast first, then its descendant, \
+                 then the slot whose status update triggered the backfill"
+            );
+            let msgids: Vec<_> = seen.iter().map(|(id, _)| *id).collect();
+            assert!(
+                msgids.windows(2).all(|w| w[0] > w[1]),
+                "backfilled ancestor broadcasts should arrive in msgid-decreasing order, got {msgids:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_live_ordering_backfill_loop() {
+            run_live_ordering_backfill(DispatchKind::Loop).await;
+        }
+
+        #[tokio::test]
+        async fn test_live_ordering_backfill_dispatch() {
+            run_live_ordering_backfill(DispatchKind::Dispatch).await;
+        }
+    }
 }

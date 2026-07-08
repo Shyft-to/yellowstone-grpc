@@ -166,13 +166,18 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 1 | Remove ParallelEncoder, direct synchronous encode_messages() | DONE | 2 | APPROVED | 7b7867b |
 | 2 | jemalloc as global allocator | DONE | 1 | APPROVED | 17d7290 |
 | 3 | Filter foldhash + per-connection FilterNames | DONE | 2 | APPROVED | 4700fbd |
-| 4 | Characterization tests (regression net, test-only) | IN_PROGRESS | 1 | - | - |
+| 4 | Characterization tests (regression net, test-only) | DONE | 1 | APPROVED | pending |
 | 5 | Pure extraction refactor: block_reconstruction.rs | PENDING | 0 | - | - |
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
 | 6b | The decoupling: geyser_dispatch broadcasts raw Processed directly (the latency win) | PENDING | 0 | - | - |
 | 6c | Shutdown/join wiring | PENDING | 0 | - | - |
 
 ## Task Notes
+
+### Task 4, attempt 1 — APPROVED (validator agent id ad40bde7688b03564)
+Hand-traced all 9 scenarios (18 tests: geyser_loop + geyser_dispatch) against the real production code, confirmed every assertion is genuinely sensitive to the behavior it claims to test (not trivially true, not a reimplementation). Confirmed the "singleton Confirmed echo" quirk is real (every Slot message broadcasts a singleton echo on Confirmed/Finalized channels regardless of its own status) and the tests' fix (filter on `.status`) is correct, not a workaround. Confirmed duplicate-BlockMeta silently overwrites with no rejection (flagged as a real, slightly surprising behavior worth a follow-up note — not a Task 4 defect, correctly characterized as baseline). Confirmed gc-boundary arithmetic (30-15=15) exactly matches real code including the processed_first_slot startup branch. Confirmed live-ordering backfill/no-backfill assertions are genuinely sensitive to reordering bugs (traced by hand). 78/78 tests pass across 3 full + 5 targeted runs, no flakiness. Scope confirmed: only grpc.rs changed, pure test addition. Minor non-blocking note: DispatchKind::Dispatch tests spawn real spin-loop OS threads (accurate to production, not observed to cause flakiness in 5 runs, but could add CI CPU pressure under heavy parallelism).
+
+**Flagged for follow-up (not a Task 4 defect)**: a second `BlockMeta` for the same slot is silently accepted and overwrites the first (grpc.rs, both geyser_loop and geyser_dispatch) with only a metric bump — no rejection, no log of which fields changed. Worth a note to the user/future task, out of scope here.
 
 ### Task 3, attempt 2 — APPROVED (validator agent id a0a290bdf47c888e6)
 Confirmed `nonempty_txn_signature_required` now FoldHashSet, verified insert/contains call sites compile correctly (foldhash::HashSet is a type alias over std HashSet with a different RandomState, Hash/Eq/Borrow<str> bounds unaffected). Independent grep confirmed no other FilterAccounts/FilterAccountsMatch fields missed. Diffed against pre-task-3 baseline to confirm only this one field changed since attempt 1, rest of Part A/B unchanged from already-approved content. 60/60 tests, clean release build + clippy -D warnings.
