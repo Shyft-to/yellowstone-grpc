@@ -19,6 +19,7 @@ use {
     },
     base64::{engine::general_purpose::STANDARD as base64_engine, Engine},
     bytes::buf::BufMut,
+    foldhash::{HashMap as FoldHashMap, HashSet as FoldHashSet},
     prost::encoding::{encode_key, encode_varint, WireType},
     solana_pubkey::{ParsePubkeyError, Pubkey},
     solana_signature::{ParseSignatureError, Signature},
@@ -313,12 +314,12 @@ impl Filter {
 #[derive(Debug, Default, Clone)]
 struct FilterAccounts {
     nonempty_txn_signature: Vec<(FilterName, Option<bool>)>,
-    nonempty_txn_signature_required: HashSet<FilterName>,
-    account: HashMap<Pubkey, HashSet<FilterName>>,
-    account_required: HashSet<FilterName>,
-    account_cuckoo: HashMap<FilterName, Arc<CuckooFilter<[u8; 32]>>>,
-    owner: HashMap<Pubkey, HashSet<FilterName>>,
-    owner_required: HashSet<FilterName>,
+    nonempty_txn_signature_required: FoldHashSet<FilterName>,
+    account: FoldHashMap<Pubkey, FoldHashSet<FilterName>>,
+    account_required: FoldHashSet<FilterName>,
+    account_cuckoo: FoldHashMap<FilterName, Arc<CuckooFilter<[u8; 32]>>>,
+    owner: FoldHashMap<Pubkey, FoldHashSet<FilterName>>,
+    owner_required: FoldHashSet<FilterName>,
     filters: Vec<(FilterName, FilterAccountsState)>,
 }
 
@@ -377,8 +378,8 @@ impl FilterAccounts {
     }
 
     fn set(
-        map: &mut HashMap<Pubkey, HashSet<FilterName>>,
-        map_required: &mut HashSet<FilterName>,
+        map: &mut FoldHashMap<Pubkey, FoldHashSet<FilterName>>,
+        map_required: &mut FoldHashSet<FilterName>,
         name: &str,
         names: &mut FilterNames,
         keys: impl Iterator<Item = FilterResult<Pubkey>>,
@@ -564,11 +565,11 @@ impl FilterAccountsLamports {
 #[derive(Debug)]
 struct FilterAccountsMatch<'a> {
     filter: &'a FilterAccounts,
-    nonempty_txn_signature: HashSet<&'a str>,
-    account: HashSet<&'a str>,
-    cuckoo: HashSet<&'a str>,
-    owner: HashSet<&'a str>,
-    data: HashSet<&'a str>,
+    nonempty_txn_signature: FoldHashSet<&'a str>,
+    account: FoldHashSet<&'a str>,
+    cuckoo: FoldHashSet<&'a str>,
+    owner: FoldHashSet<&'a str>,
+    data: FoldHashSet<&'a str>,
 }
 
 impl<'a> FilterAccountsMatch<'a> {
@@ -584,8 +585,8 @@ impl<'a> FilterAccountsMatch<'a> {
     }
 
     fn extend(
-        set: &mut HashSet<&'a str>,
-        map: &'a HashMap<Pubkey, HashSet<FilterName>>,
+        set: &mut FoldHashSet<&'a str>,
+        map: &'a FoldHashMap<Pubkey, FoldHashSet<FilterName>>,
         key: &Pubkey,
     ) {
         if let Some(names) = map.get(key) {

@@ -165,7 +165,7 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 |---|------|--------|----------|---------------|--------|
 | 1 | Remove ParallelEncoder, direct synchronous encode_messages() | DONE | 2 | APPROVED | 7b7867b |
 | 2 | jemalloc as global allocator | DONE | 1 | APPROVED | 17d7290 |
-| 3 | Filter foldhash + per-connection FilterNames | IN_PROGRESS | 2 | pending re-validation | - |
+| 3 | Filter foldhash + per-connection FilterNames | DONE | 2 | APPROVED | pending |
 | 4 | Characterization tests (regression net, test-only) | PENDING | 0 | - | - |
 | 5 | Pure extraction refactor: block_reconstruction.rs | PENDING | 0 | - | - |
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
@@ -173,6 +173,9 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 6c | Shutdown/join wiring | PENDING | 0 | - | - |
 
 ## Task Notes
+
+### Task 3, attempt 2 — APPROVED (validator agent id a0a290bdf47c888e6)
+Confirmed `nonempty_txn_signature_required` now FoldHashSet, verified insert/contains call sites compile correctly (foldhash::HashSet is a type alias over std HashSet with a different RandomState, Hash/Eq/Borrow<str> bounds unaffected). Independent grep confirmed no other FilterAccounts/FilterAccountsMatch fields missed. Diffed against pre-task-3 baseline to confirm only this one field changed since attempt 1, rest of Part A/B unchanged from already-approved content. 60/60 tests, clean release build + clippy -D warnings.
 
 ### Task 3, attempt 1 — REJECTED (validator agent id a36e569d57ee7081a)
 Part A/B mostly correct and well-tested (60 tests pass, foldhash retype confirmed complete for the fields it touched, FilterNames de-sharing confirmed coherent with no residual Arc/Mutex, both new name.rs tests confirmed substantive not tautological). **Blocking finding**: `nonempty_txn_signature_required` (filter.rs) was left on std HashSet while its structural siblings `account_required`/`owner_required` were retyped to FoldHashSet — all three live in the same FilterAccounts struct, populated identically at construction, queried identically per-filter-per-message in get_filters(). No basis for treating it differently; fix is a straightforward retype + 2 insert-site updates, same pattern as the other two. Everything else approved as-is.
