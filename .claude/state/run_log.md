@@ -10,12 +10,67 @@
   Goal: reduce end-to-end and tail latency of gRPC fan-out without regressing correctness of block reconstruction (duplicate slot handling, gc timing, confirmed/finalized ordering) or existing config/API compatibility.
 - Base branch: i2
 - Feature branch: implement/port-master-latency-opts
-- Status: PLANNING
+- Status: EXECUTING
 - Started: 2026-07-08
 - Last updated: 2026-07-08
 
 ## Approved Plan
-<pending>
+
+Approved on round 3 (evaluator agent id a420b61810a660ddf). Verification performed: re-checked `GrpcService::create` spawn wiring (grpc.rs:595-719) — confirmed `replay_first_available_slot` is an `Arc<AtomicU64>` constructed once (line 609), cloned into the `GrpcService` struct field (line 660) before the original binding moves into whichever loop/thread is spawned (lines 698/712) — so relocating it into the reconstruction thread's closure is a pure relocation; the RPC-side reader (`subscribe_first_available_slot`, grpc.rs:2142-2154) is unaffected since it reads the independent struct clone. This closes the round-2 blocking gap. `service_replay` extraction (Task 5) confirmed to faithfully cover both call sites (grpc.rs:1497-1519 sync, 1107-1127 async) which are functionally identical bodies. No factual errors or regressions found in the round-3 rewrite; all round-1/2 feedback points remain correctly addressed.
+
+Minor non-blocking notes: Task 6a's test may need to substitute a direct call to the reconstruction thread's spawn function (mirroring this file's existing `client_loop`-direct-call test idiom) instead of the full `GrpcService::create` wiring if that proves unwieldy — either way proves the same byte-identical-`ReplayedResponse` characterization. Reconstruction-channel-depth monitoring gauge confirmed out of scope for this task list.
+
+**Task 1 — Remove `ParallelEncoder` rayon/channel bridge, replace with direct synchronous encoding**
+- Change: Add a new `encode_messages()` free function (sequential, no rayon) to `yellowstone-grpc-geyser/src/plugin/filter/encoder.rs`, matching master's `1453f2c`. Replace all 6 call sites of the old `ParallelEncoder` API — `encode_blocking()` in `geyser_dispatch` (`grpc.rs:1428, 1469, 1491`) and `encode().await` in `geyser_loop` (`grpc.rs:1036, 1077, 1101`) — with direct calls to `encode_messages()`. Drop the `parallel_encoder` parameter from `GrpcService::create`, `geyser_dispatch`, and `geyser_loop`. Update the caller in `plugin/entry.rs` (currently constructs `ParallelEncoder::new(encoder_threads)` at line 119 and passes it through). Delete `yellowstone-grpc-geyser/src/parallel.rs`, remove `pub mod parallel` from `lib.rs`, remove the `encoder_threads` config field (`config.rs:340-343,414`) and its `deny_unknown_fields`-enforced parsing path. Drop the `rayon` dependency from `yellowstone-grpc-geyser/Cargo.toml` if it becomes orphaned after this change (check for other uses first).
+- Why: Master's `1453f2c` removes the rayon/channel bridge entirely in favor of synchronous encoding; the bridge's cross-thread hop (mpsc + oneshot round-trip for the async path, and pool.install jitter for the sync path) sits directly in front of Processed-commitment broadcast and is a plausible latency contributor.
+- Tests: Baseline `cargo test -p yellowstone-grpc-geyser` before changes (expect 56 passed). Port the 4 existing `parallel.rs` tests (`test_parallel_encoder_transactions`, `test_parallel_encoder_accounts`, `test_small_batch_uses_sync`, `test_mixed_batch`) into `encoder.rs` against the new function, adjusted for the removed threshold-based branching. Add an idempotency test. Add a test asserting a config file with the old `encoder_threads` field now fails to parse (breaking-config-change regression, matches master's precedent — must be called out in CHANGELOG). **Hard requirement**: extend the existing `benches/encode.rs` (already wired via `[[bench]] name = "encode"` under the `bench` feature) with a Criterion comparison of today's rayon-parallel `encode_blocking`/`encode` vs. the new sequential `encode_messages()` at batch sizes 1/4/16/64/256. Must be run and results reported before this task is considered done — if sequential is meaningfully slower at realistic batch sizes, flag back rather than silently accepting a throughput regression. Full regression suite after.
+- Risk: Medium.
+
+**Task 2 — jemalloc as global allocator**
+- Change: `tikv-jemallocator = "0.6.1"` is already declared (currently unused) in the root `Cargo.toml` workspace deps. Add it as a direct dependency of `yellowstone-grpc-geyser` (with `disable_initial_exec_tls` feature) and add `#[global_allocator] static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;` in `yellowstone-grpc-geyser/src/lib.rs`, per master's `1453f2c`.
+- Why: Master's precedent for reduced allocator contention/latency under sustained allocation load in the fan-out hot path.
+- Tests: Full `cargo test -p yellowstone-grpc-geyser` suite must still pass unchanged. Explicitly flagged risk (not testable in this harness): cdylib + custom global allocator interaction with the host validator process is unverifiable outside a live validator — call this out as a deployment-time risk in the PR/commit description.
+- Risk: Low, with the one flagged unverifiable-outside-production caveat.
+
+**Task 3 — Filter foldhash + per-connection `FilterNames`**
+- Change: In `yellowstone-grpc-geyser/src/plugin/filter/filter.rs`, add `foldhash` as a workspace dependency and retype `FilterAccounts`'s `account`/`account_required`/`account_cuckoo`/`owner`/`owner_required`/`nonempty_txn_signature_required` fields and `FilterAccountsMatch`'s five `HashSet<&str>` fields (`nonempty_txn_signature`, `account`, `cuckoo`, `owner`, `data`) from std `HashMap`/`HashSet` to foldhash-backed equivalents. Do **not** adopt master's `72cf363` aggregate/reverse-index restructuring — hasher swap only. Remove `filter_names: Arc<Mutex<FilterNames>>` from `GrpcService` (`grpc.rs:538,640,662,2055,2069-2072`); store the size-limit primitives instead, and construct a `FilterNames` instance locally per connection in the incoming-filter task.
+- Why: foldhash is a faster non-cryptographic hasher for the account/owner filter-matching lookup tables, matching master's `72cf363`. De-sharing `FilterNames` removes unnecessary shared-state coupling between unrelated connections (only locked in the per-connection subscribe path, never per-message hot path).
+- Tests: Baseline suite must pass unchanged. Add a test proving two concurrent connections' `FilterNames` instances don't interact. Add a characterization test asserting two connections with an identical filter name no longer share an interned `FilterName` instance (documents the memory trade-off — loses cross-connection name dedup — rather than hiding it, matches master's precedent exactly).
+- Risk: Low-medium.
+
+**Task 4 — Characterization tests (test-only, regression net for Tasks 5/6)**
+- Change: Add test-only characterization tests for today's `geyser_dispatch`/`geyser_loop` BTreeMap bookkeeping: dedup by write_version, block-sealing gating (`try_seal`), duplicate-BlockMeta detection, missed-status parent-slot propagation, gc timing (`FINALIZATION_SAFETY_BUFFER=10 + replay_stored_slots`), and replay-buffer servicing — including both the no-backfill case (assert strictly-increasing msgid delivery order for a live Processed subscriber) and the backfill case (must document today's existing non-monotonicity — missed-status backfill ancestors are broadcast in msgid-**decreasing** order relative to each other via `.rev()` iteration, verified at grpc.rs:993/1364 region — do not assert a false "always increasing" baseline).
+- Why: This is the regression net Tasks 5/6 are measured against.
+- Tests: These tests are the deliverable. Must all pass against current (pre-refactor) code before Task 5 begins.
+- Risk: Low (test-only).
+
+**Task 5 — Pure extraction refactor into `block_reconstruction.rs`**
+- Change: New `block_reconstruction.rs` module with `SlotMessages`, `MessageId`, and a `BlockReconstructionState` struct exposing `on_message(...)` reproducing today's bookkeeping verbatim. Additionally expose a `service_replay(...)` method lifting today's replay-servicing logic verbatim from grpc.rs:1497-1519 (sync)/1107-1127 (async) — confirmed functionally identical bodies — as a single callable method usable by both call sites. Rewire `geyser_dispatch`/`geyser_loop` to call `on_message`/`service_replay`; no threading change yet.
+- Why: Isolates bookkeeping and replay-servicing behind a stable interface so Task 6a's thread-split only relocates *which thread calls the method*, never touches the method's logic.
+- Tests: Task 4's characterization tests must pass unchanged before and after. Add direct unit tests against `BlockReconstructionState` in isolation.
+- Risk: Medium (large mechanical diff, no concurrency risk yet).
+
+**Task 6a — Spawn reconstruction thread + channel; move BTreeMap and replay ownership; zero latency win yet**
+- Change: Spawn a plain blocking `std::thread` (not master's tokio-runtime-per-thread pattern — deliberate, evaluator-blessed deviation: `try_recv`/`recv`/`oneshot::send` need no active runtime, proven by today's `geyser_dispatch` already doing exactly this) owning a `BlockReconstructionState`, fed via a new channel from `geyser_dispatch`. At this step the reconstruction thread does everything post-receive: msgid assignment, `on_message`, batching/encoding, and broadcasting for all commitment levels including Processed — `geyser_dispatch` becomes a pure forwarder, zero latency win yet. `replay_stored_slots_rx` and `replay_first_available_slot` move into the reconstruction thread's spawn closure (matching master's `2146785` precedent), replacing their current placement in `geyser_dispatch`/`geyser_loop`'s parameter lists (grpc.rs:697-698,711-712). Update `GrpcService::create`'s spawn wiring (grpc.rs:685-719) accordingly. Note: `replay_first_available_slot` is an `Arc<AtomicU64>` already cloned once into the `GrpcService` struct field (grpc.rs:660) before the original binding is moved into whichever loop/thread is spawned — this move is a pure relocation; the struct's own clone (read by `subscribe_first_available_slot`, grpc.rs:2142-2154) is unaffected.
+- Why: Mechanical plumbing step proven correct in isolation before Task 6b introduces the actual latency-relevant ordering change.
+- Tests: Extend Task 4's replay-servicing characterization test to run twice — pre-6a single-threaded baseline vs. post-6a two-thread pipeline (via real `GrpcService::create` construction, or a direct call to the reconstruction thread's spawn function mirroring this file's existing `client_loop`-direct-call test idiom if the former proves unwieldy) — asserting byte-identical `ReplayedResponse` for the same injected sequence + query. Re-run all Task 4 bookkeeping tests end-to-end through the two-thread pipeline to confirm zero behavior change.
+- Risk: Medium-high.
+
+**Task 6b — The actual decoupling (the latency win)**
+- Change: Introduce a shared atomic-backed `MessageId` (`Arc<AtomicU64>`, `fetch_add`) replacing the current per-function local `&mut MessageId` struct (grpc.rs:280-289) — required because after this step both `geyser_dispatch` and the reconstruction thread mint ids independently and must draw from one monotonic space for `client_loop`'s replay-path `sort_by_key` correctness. Channel type changes from `Message` to `(u64, Message)`. `geyser_dispatch` stops being a pure forwarder: it now batches/encodes/broadcasts raw Processed messages directly itself (the latency win). The reconstruction thread stops broadcasting raw Processed messages; it retains Confirmed/Finalized broadcasts plus derived-Processed-only messages (sealed Block, synthesized missed-status Slot backfill).
+- Why: This is the change that decouples raw Processed-commitment latency from block-reconstruction bookkeeping latency — the stated goal of the whole optimization.
+- Tests: Full 2-thread pipeline correctness suite. Decoupling proof test: inject reconstruction-thread backpressure (pausable gate) and assert Processed for unrelated/later slots still flows promptly. Duplicate-slot/gc/ordering regressions carried through the real two-thread pipeline. Live-ordering relaxation stated and tested explicitly: (a) what relaxes — sealed Block/derived-Processed backfill Slot messages can arrive arbitrarily late relative to later raw Processed messages (bounded by reconstruction-thread channel backlog); raw pass-through messages stay strictly ordered. (b) verified invariant: per-pubkey write_version ordering unaffected (raw push happens before dedup-nulling, which only mutates the stored/Confirmed/Finalized snapshot); no downstream consumer requires cross-slot Processed ordering. (c) Concrete backpressure test: pausable gate, feed complete slot N then pause, feed disjoint slot N+1, assert N+1's raw Processed arrives before N's sealed Block is delivered; assert same-pubkey write_version ordering holds under starvation; release gate, assert Block for N still delivered (late, not dropped) with lower msgid than already-delivered N+1 messages; verify a Confirmed subscriber gets the complete/correct slot-N set under the same cycle. **Reconnect-during-backpressure test** (required): while reconstruction thread is gated/paused, inject a real `from_slot` replay request via `replay_stored_slots_tx`/oneshot — assert it blocks until the reconstruction thread's channel drains and its idle-branch services it from current BTreeMap state (correct, possibly delayed) — this relocates today's existing degraded-mode behavior, it does not introduce a new failure mode. State the trade-off explicitly in the PR description: raw Processed latency is decoupled/near-instant after this split, while `from_slot` replay freshness now depends solely on the reconstruction thread's independent backlog — acceptable since replay-on-reconnect isn't the latency-sensitive path this effort targets (a channel-depth monitoring gauge is a natural follow-up, out of scope here).
+- Risk: High — do not downgrade this risk rating during implementation.
+
+**Task 6c — Shutdown/join wiring**
+- Change: Wire clean shutdown for the reconstruction thread: dropping the new channel's sender (when `geyser_dispatch` exits) propagates channel closure to the reconstruction thread's receive loop; add the new `JoinHandle` to be joined in `plugin/entry.rs` alongside the existing `encoder_handle`-style join pattern.
+- Why: Prevents the new thread from becoming orphaned/leaked on shutdown or plugin reload.
+- Tests: Clean shutdown test — trigger cancellation/drop, assert the reconstruction thread's `JoinHandle` completes within a bounded timeout. In-flight-at-shutdown message handling should match `geyser_dispatch`'s own pre-existing shutdown semantics (today not retroactively joined — carried over as an explicit non-goal, not newly introduced).
+- Risk: Low.
+
+**Explicit non-goals**: master's `yellowstone_block_machine`/`BlockMachineStorage` crate; tokio-runtime-per-thread pattern (settled: plain `std::thread`); splitting the async `geyser_loop` fallback; master's `72cf363` `FilterAccounts` aggregate/reverse-index restructuring; master's `Bytes`→`Vec<u8>`/encoded_len const-generic changes; CPU-pinning the new reconstruction thread; retroactively joining `geyser_dispatch`'s own pre-existing unjoined thread handle; making the new dispatch→reconstruction channel bounded; a reconstruction-channel-depth monitoring gauge.
+
+**Carried-over unresolved/unverifiable items (documented, not blocking)**: jemalloc/cdylib/global-allocator interaction with the host validator process is unverifiable outside a live validator deployment (Task 2); Task 1's Criterion microbenchmark result is unknown until actually run — must be run and reported as part of Task 1, not assumed favorable.
 
 ## Planning History
 ### Round 1
@@ -102,12 +157,20 @@
 
   Remaining open items (not blocking, flagged for evaluator): Task 1 microbench result unknown until run; jemalloc/cdylib/host-process interaction unverifiable outside live validator (carried over); reconstruction-channel-depth monitoring gauge suggested as natural follow-up, not scoped as a task — evaluator asked to confirm in/out of scope explicitly.
 
-- Evaluator verdict: (pending)
-- Evaluator feedback: (pending)
+- Evaluator verdict: APPROVED (agent id a420b61810a660ddf)
+- Evaluator feedback: Round-2 blocking gap (replay ownership transfer) closed and independently re-verified against the `Arc<AtomicU64>` sharing pattern in `GrpcService::create`. Minor non-blocking notes: Task 6a's test may substitute a direct reconstruction-thread-spawn-function call for the full `GrpcService::create` wiring if that proves unwieldy; channel-depth monitoring gauge confirmed out of scope. See "Approved Plan" above for the full final task list.
 
 ## Task Progress
 | # | Task | Status | Attempts | Last Verdict | Commit |
 |---|------|--------|----------|---------------|--------|
+| 1 | Remove ParallelEncoder, direct synchronous encode_messages() | PENDING | 0 | - | - |
+| 2 | jemalloc as global allocator | PENDING | 0 | - | - |
+| 3 | Filter foldhash + per-connection FilterNames | PENDING | 0 | - | - |
+| 4 | Characterization tests (regression net, test-only) | PENDING | 0 | - | - |
+| 5 | Pure extraction refactor: block_reconstruction.rs | PENDING | 0 | - | - |
+| 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
+| 6b | The decoupling: geyser_dispatch broadcasts raw Processed directly (the latency win) | PENDING | 0 | - | - |
+| 6c | Shutdown/join wiring | PENDING | 0 | - | - |
 
 ## Blockers
 <none>
