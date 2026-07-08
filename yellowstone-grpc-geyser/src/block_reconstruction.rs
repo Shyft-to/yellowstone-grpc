@@ -26,15 +26,21 @@ use {
 /// and late-arriving block_meta messages.
 const FINALIZATION_SAFETY_BUFFER: u64 = 10;
 
-#[derive(Debug, Default)]
+/// Monotonic id, shareable via `Clone` (backed by an `Arc<AtomicU64>`).
+/// After the dispatch/reconstruction thread split, both `geyser_dispatch`
+/// (which mints ids for raw incoming messages) and the block-reconstruction
+/// thread (which mints ids for messages it synthesizes: the sealed `Block`
+/// message, backfilled ancestor `Slot` messages) must draw from the same id
+/// space, or `client_loop`'s replay-path `sort_by_key` breaks.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MessageId {
-    id: u64,
+    id: Arc<AtomicU64>,
 }
 
 impl MessageId {
-    const fn next(&mut self) -> u64 {
-        self.id = self.id.checked_add(1).expect("message id overflow");
-        self.id
+    pub(crate) fn next(&self) -> u64 {
+        let prev = self.id.fetch_add(1, Ordering::Relaxed);
+        prev.checked_add(1).expect("message id overflow")
     }
 }
 
@@ -56,7 +62,7 @@ pub(crate) struct SlotMessages {
 }
 
 impl SlotMessages {
-    pub fn try_seal(&mut self, msgid_gen: &mut MessageId) -> Option<(u64, Message)> {
+    pub fn try_seal(&mut self, msgid_gen: &MessageId) -> Option<(u64, Message)> {
         if !self.sealed {
             if let Some(block_meta) = &self.block_meta {
                 let executed_transaction_count = block_meta.executed_transaction_count as usize;
@@ -106,6 +112,20 @@ impl SlotMessages {
 #[derive(Debug)]
 pub(crate) struct DispatchItem {
     pub message: (u64, Message),
+    /// True iff `message` is exactly the raw input passed to `on_message`/
+    /// `on_message_with_id` for this call — as opposed to something
+    /// `BlockReconstructionState` synthesized itself (the sealed `Block`
+    /// message, or a backfilled ancestor `Slot` message). Distinguished by
+    /// comparing the item's msgid against the input message's msgid: ids
+    /// are minted from one monotonic, never-reused space, so this
+    /// comparison is exact regardless of the item's position in the
+    /// dispatch sequence.
+    ///
+    /// Callers that broadcast raw pass-through messages on
+    /// `CommitmentLevel::Processed` themselves (i.e. `geyser_dispatch`,
+    /// post-decoupling) use this to broadcast only the derived items on
+    /// Processed, since the raw one was already broadcast directly.
+    pub is_raw_message: bool,
     pub confirmed_messages: Option<Vec<(u64, Message)>>,
     pub finalized_messages: Option<Vec<(u64, Message)>>,
 }
@@ -139,17 +159,44 @@ impl BlockReconstructionState {
         }
     }
 
+    /// Overrides the id generator with a shared one (used by the
+    /// block-reconstruction thread so its derived-message ids and
+    /// `geyser_dispatch`'s raw-message ids are drawn from one monotonic
+    /// space). Left at its constructor default (a fresh, unshared counter)
+    /// for single-threaded callers such as `geyser_loop`.
+    pub(crate) fn with_msgid_gen(mut self, msgid_gen: MessageId) -> Self {
+        self.msgid_gen = msgid_gen;
+        self
+    }
+
     /// Applies the bookkeeping for a single incoming message (gc sweep,
     /// dedup by write_version, block sealing, missed-status ancestor
     /// backfill) and returns the messages ready to be broadcast, in the
     /// exact order they should be sent, each already carrying its
     /// Confirmed/Finalized companions (if any) as derived from the BTreeMap.
+    /// Mints its own msgid via the internal id generator.
     pub(crate) fn on_message(
         &mut self,
         message: Message,
     ) -> impl Iterator<Item = DispatchItem> + '_ {
-        metrics::message_queue_size_dec();
         let msgid = self.msgid_gen.next();
+        self.on_message_with_id(msgid, message)
+    }
+
+    /// Same as `on_message`, but the msgid for the raw input `message` is
+    /// supplied by the caller instead of minted internally. Used by the
+    /// block-reconstruction thread, whose input messages arrive
+    /// pre-tagged with the id `geyser_dispatch` already assigned (and
+    /// already broadcast on `CommitmentLevel::Processed` directly) —
+    /// `on_message_with_id` must reuse that exact id rather than minting a
+    /// fresh one, so the BTreeMap and downstream replay agree with
+    /// dispatch on what id this message has.
+    pub(crate) fn on_message_with_id(
+        &mut self,
+        msgid: u64,
+        message: Message,
+    ) -> impl Iterator<Item = DispatchItem> + '_ {
+        metrics::message_queue_size_dec();
 
         if let Message::Slot(slot_message) = &message {
             metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
@@ -206,11 +253,11 @@ impl BlockReconstructionState {
                     metrics::update_invalid_blocks("unexpected message: BlockMeta (duplicate)");
                 }
                 slot_messages.block_meta = Some(Arc::clone(msg));
-                sealed_block_msg = slot_messages.try_seal(&mut self.msgid_gen);
+                sealed_block_msg = slot_messages.try_seal(&self.msgid_gen);
             }
             Message::Transaction(msg) => {
                 slot_messages.transactions.push(Arc::clone(&msg.transaction));
-                sealed_block_msg = slot_messages.try_seal(&mut self.msgid_gen);
+                sealed_block_msg = slot_messages.try_seal(&self.msgid_gen);
             }
             // Dedup accounts by max write_version
             Message::Account(msg) => {
@@ -235,7 +282,7 @@ impl BlockReconstructionState {
             }
             Message::Entry(msg) => {
                 slot_messages.entries.push(Arc::clone(msg));
-                sealed_block_msg = slot_messages.try_seal(&mut self.msgid_gen);
+                sealed_block_msg = slot_messages.try_seal(&self.msgid_gen);
             }
             _ => {}
         }
@@ -257,7 +304,7 @@ impl BlockReconstructionState {
             self.backfill_missed_status(slot, status, &mut messages_vec);
         }
 
-        self.build_dispatch_items(messages_vec)
+        self.build_dispatch_items(messages_vec, msgid)
     }
 
     /// Removes outdated block reconstruction info once a slot is finalized
@@ -387,13 +434,14 @@ impl BlockReconstructionState {
     fn build_dispatch_items(
         &mut self,
         messages_vec: Vec<(u64, Message)>,
+        raw_msgid: u64,
     ) -> impl Iterator<Item = DispatchItem> + '_ {
         self.record_slot_status_transitions(&messages_vec);
 
         messages_vec
             .into_iter()
             .rev()
-            .map(move |message| self.dispatch_item_for(message))
+            .map(move |message| self.dispatch_item_for(message, raw_msgid))
     }
 
     /// Unconditionally records, for every Slot-status message in
@@ -426,9 +474,11 @@ impl BlockReconstructionState {
     }
 
     /// Computes the Confirmed/Finalized companions (if any) for a single
-    /// message and wraps it into a `DispatchItem`. Read-only: relies on
+    /// message and wraps it into a `DispatchItem`, tagging it as the raw
+    /// input iff its msgid matches `raw_msgid`. Read-only: relies on
     /// `record_slot_status_transitions` having already run for this batch.
-    fn dispatch_item_for(&self, message: (u64, Message)) -> DispatchItem {
+    fn dispatch_item_for(&self, message: (u64, Message), raw_msgid: u64) -> DispatchItem {
+        let is_raw_message = message.0 == raw_msgid;
         if let Message::Slot(slot) = &message.1 {
             let (mut confirmed_messages, mut finalized_messages) = match slot.status {
                 SlotStatus::Processed
@@ -462,6 +512,7 @@ impl BlockReconstructionState {
             finalized_messages.push(message.clone());
             DispatchItem {
                 message,
+                is_raw_message,
                 confirmed_messages: Some(confirmed_messages),
                 finalized_messages: Some(finalized_messages),
             }
@@ -489,6 +540,7 @@ impl BlockReconstructionState {
 
             DispatchItem {
                 message,
+                is_raw_message,
                 confirmed_messages: (!confirmed_messages.is_empty()).then_some(confirmed_messages),
                 finalized_messages: (!finalized_messages.is_empty()).then_some(finalized_messages),
             }

@@ -1,6 +1,6 @@
 use {
     crate::{
-        block_reconstruction::{BlockReconstructionState, DispatchItem},
+        block_reconstruction::{BlockReconstructionState, DispatchItem, MessageId},
         config::{ConfigGrpc, GrpcAddress},
         metered::MeteredLayer,
         metrics::{
@@ -282,9 +282,94 @@ type ReplayStoredSlotsRequest = (CommitmentLevel, Slot, oneshot::Sender<Replayed
 
 type SubscriptionTracker = Arc<StdMutex<HashMap<String, usize>>>;
 
+/// Drains and broadcasts a `Processed`-commitment batch, if non-empty.
+/// Shared by `geyser_dispatch` and `block_reconstruction_dispatch`, which
+/// each maintain their own `processed_messages` batch/flush cadence but
+/// hit the exact same encode+broadcast+reset sequence at flush time.
+fn flush_processed_batch(
+    broadcast_tx: &broadcast::Sender<BroadcastedMessage>,
+    processed_messages: &mut Vec<(u64, Message)>,
+    processed_messages_max: usize,
+) {
+    if processed_messages.is_empty() {
+        return;
+    }
+    metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+    encode_messages(processed_messages);
+    let flushed = std::mem::replace(
+        processed_messages,
+        Vec::with_capacity(processed_messages_max),
+    );
+    let _ = broadcast_tx.send((CommitmentLevel::Processed, flushed.into()));
+}
+
 static CONCURRENT_SUBSCRIPTIONS_PER_REMOTE_PEER_SK_ADDR: LazyLock<
     StdMutex<HashMap<SocketAddr, usize>>,
 > = LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Test-only hook letting tests pause `block_reconstruction_dispatch`'s
+/// per-item processing to simulate reconstruction-thread backpressure —
+/// used to prove the dispatch/reconstruction decoupling Task 6b introduces
+/// and to exercise reconnect-during-backpressure behavior. Entirely
+/// `#[cfg(test)]`: this whole module, and the single call site that checks
+/// it inside `block_reconstruction_dispatch`, are compiled out of (and
+/// therefore unreachable from) any non-test build.
+#[cfg(test)]
+pub(crate) mod reconstruction_test_gate {
+    use std::{
+        cell::RefCell,
+        sync::{Arc, Condvar, Mutex},
+    };
+
+    #[derive(Default)]
+    pub(crate) struct Gate {
+        closed: Mutex<bool>,
+        cond: Condvar,
+    }
+
+    impl Gate {
+        pub(crate) fn new_closed() -> Arc<Self> {
+            Arc::new(Self {
+                closed: Mutex::new(true),
+                cond: Condvar::new(),
+            })
+        }
+
+        pub(crate) fn release(&self) {
+            *self.closed.lock().unwrap() = false;
+            self.cond.notify_all();
+        }
+
+        fn wait_while_closed(&self) {
+            let mut closed = self.closed.lock().unwrap();
+            while *closed {
+                closed = self.cond.wait(closed).unwrap();
+            }
+        }
+    }
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Arc<Gate>>> = const { RefCell::new(None) };
+    }
+
+    /// Installs `gate` for the *calling* OS thread only. Must be called
+    /// from within the block-reconstruction thread's own spawn closure,
+    /// before it starts running `block_reconstruction_dispatch`, so the
+    /// thread-local is set on the same OS thread that later checks it.
+    pub(crate) fn install(gate: Arc<Gate>) {
+        CURRENT.with(|cell| *cell.borrow_mut() = Some(gate));
+    }
+
+    /// Blocks the calling thread if a gate was installed for it and that
+    /// gate is still closed. A no-op if no gate was installed, which is
+    /// the case for every real (non-test-driven) reconstruction thread.
+    pub(crate) fn wait_if_installed() {
+        let gate = CURRENT.with(|cell| cell.borrow().clone());
+        if let Some(gate) = gate {
+            gate.wait_while_closed();
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum ClientSnapshotReplayError {
@@ -600,8 +685,21 @@ impl GrpcService {
             );
         }
 
+        let processed_messages_max = config.processed_messages_max;
+        let replay_stored_slots = config.replay_stored_slots;
+
         if let Some(cpu_core) = config.geyser_dispatch_cpu_core {
             let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
+
+            // One shared, atomic-backed id space: geyser_dispatch mints ids
+            // for raw messages, the reconstruction thread mints ids for
+            // what it synthesizes (sealed Block, backfilled ancestor Slot
+            // messages) — both must agree on one monotonic space for
+            // client_loop's replay-path sort_by_key to stay correct now
+            // that they're independent broadcasters.
+            let msgid_gen = MessageId::default();
+            let dispatch_msgid_gen = msgid_gen.clone();
+            let dispatch_broadcast_tx = broadcast_tx.clone();
 
             std::thread::Builder::new()
                 .name("block-reconstruction".into())
@@ -611,8 +709,9 @@ impl GrpcService {
                         broadcast_tx,
                         replay_stored_slots_rx,
                         replay_first_available_slot,
-                        config.replay_stored_slots,
-                        config.processed_messages_max,
+                        replay_stored_slots,
+                        processed_messages_max,
+                        msgid_gen,
                     );
                 })
                 .expect("failed to spawn block-reconstruction thread");
@@ -624,7 +723,14 @@ impl GrpcService {
                     {
                         log::warn!("geyser-dispatch: failed to pin to CPU {cpu_core}: {e}");
                     }
-                    Self::geyser_dispatch(messages_rx, blocks_meta_tx, reconstruction_tx);
+                    Self::geyser_dispatch(
+                        messages_rx,
+                        blocks_meta_tx,
+                        reconstruction_tx,
+                        dispatch_broadcast_tx,
+                        dispatch_msgid_gen,
+                        processed_messages_max,
+                    );
                 })
                 .expect("failed to spawn geyser-dispatch thread");
         } else {
@@ -635,8 +741,8 @@ impl GrpcService {
                     broadcast_tx,
                     replay_stored_slots_rx,
                     replay_first_available_slot,
-                    config.replay_stored_slots,
-                    config.processed_messages_max,
+                    replay_stored_slots,
+                    processed_messages_max,
                 )
                 .await;
             });
@@ -720,7 +826,12 @@ impl GrpcService {
                     };
 
                     for item in state.on_message(message) {
-                        let DispatchItem { message, confirmed_messages, finalized_messages } = item;
+                        // geyser_loop is single-threaded and broadcasts every
+                        // item (raw or derived) on Processed itself — unlike
+                        // the split geyser_dispatch/block_reconstruction_dispatch
+                        // pipeline, is_raw_message doesn't apply here.
+                        let DispatchItem { message, confirmed_messages, finalized_messages, .. } =
+                            item;
                         if matches!(&message.1, Message::Slot(_)) {
                             // processed
                             processed_messages.push(message);
@@ -791,18 +902,35 @@ impl GrpcService {
         info!("Geyser loop exiting");
     }
 
-    /// Pure forwarder from the plugin-facing inbound channel to the
-    /// block-reconstruction thread's channel. Runs on a dedicated,
-    /// CPU-pinned std::thread and spin-loops via try_recv() to avoid tokio
-    /// scheduler wake latency. Owns no bookkeeping of its own: the only
-    /// thing it does besides forwarding is the blocks_meta_tx passthrough
-    /// for Slot/BlockMeta messages, which is independent of the BTreeMap
-    /// bookkeeping the reconstruction thread owns.
+    /// Mints a msgid for each raw incoming message and, unlike the
+    /// pre-decoupling forwarder this replaces, itself batches/encodes/
+    /// broadcasts these raw pass-through messages on
+    /// `CommitmentLevel::Processed` directly — this is the actual latency
+    /// win: Processed delivery no longer waits on the block-reconstruction
+    /// thread's BTreeMap bookkeeping. Each message (already carrying the id
+    /// this thread just broadcast it under) is then forwarded to the
+    /// block-reconstruction thread's channel, which independently derives
+    /// and broadcasts Confirmed/Finalized (for every message) and
+    /// Processed-only derived messages (sealed Block, backfilled ancestor
+    /// Slot messages) — never re-broadcasting the raw message itself, since
+    /// this thread already did.
+    ///
+    /// Runs on a dedicated, CPU-pinned std::thread and spin-loops via
+    /// try_recv() to avoid tokio scheduler wake latency. Batching/flush
+    /// cadence mirrors the block-reconstruction thread's own Processed
+    /// cadence: flush immediately on every `Message::Slot`, flush whenever
+    /// try_recv() drains empty, or flush at `processed_messages_max`.
     fn geyser_dispatch(
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
-        reconstruction_tx: mpsc::UnboundedSender<Message>,
+        reconstruction_tx: mpsc::UnboundedSender<(u64, Message)>,
+        broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        msgid_gen: MessageId,
+        processed_messages_max: usize,
     ) {
+        let processed_messages_max = processed_messages_max.max(1);
+        let mut processed_messages = Vec::with_capacity(processed_messages_max);
+
         loop {
             match messages_rx.try_recv() {
                 Ok(message) => {
@@ -811,12 +939,30 @@ impl GrpcService {
                             let _ = blocks_meta_tx.send(message.clone());
                         }
                     }
-                    if reconstruction_tx.send(message).is_err() {
+
+                    let msgid = msgid_gen.next();
+                    let is_slot = matches!(&message, Message::Slot(_));
+
+                    if reconstruction_tx.send((msgid, message.clone())).is_err() {
                         info!("Geyser dispatch: block-reconstruction channel closed");
                         break;
                     }
+
+                    processed_messages.push((msgid, message));
+                    if is_slot || processed_messages.len() >= processed_messages_max {
+                        flush_processed_batch(
+                            &broadcast_tx,
+                            &mut processed_messages,
+                            processed_messages_max,
+                        );
+                    }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
+                    flush_processed_batch(
+                        &broadcast_tx,
+                        &mut processed_messages,
+                        processed_messages_max,
+                    );
                     std::hint::spin_loop();
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -830,88 +976,86 @@ impl GrpcService {
     }
 
     /// Owns the `BlockReconstructionState` (BTreeMap bookkeeping, gc,
-    /// sealing, replay buffer) and the batching/encode/broadcast for all
-    /// three commitment levels. Runs on its own dedicated std::thread (fed
+    /// sealing, replay buffer). Runs on its own dedicated std::thread (fed
     /// by `geyser_dispatch`'s forwarding channel), deliberately *not*
-    /// CPU-pinned. Otherwise identical in behavior to the pre-split
-    /// `geyser_dispatch` spin-loop: uses try_recv() and flushes accumulated
-    /// processed messages whenever the inbox is momentarily empty.
+    /// CPU-pinned. Broadcasts Confirmed/Finalized for every `DispatchItem`
+    /// (unchanged from before the decoupling), but for Processed only
+    /// broadcasts the *derived* items it synthesizes itself — the sealed
+    /// Block message and backfilled ancestor Slot messages
+    /// (`!item.is_raw_message`) — since `geyser_dispatch` already broadcast
+    /// the raw pass-through message directly. This is the live-ordering
+    /// relaxation this split introduces: these derived Processed messages
+    /// can now arrive arbitrarily late relative to later raw Processed
+    /// messages, bounded only by this thread's channel backlog; raw
+    /// messages themselves stay strictly ordered since `geyser_dispatch`
+    /// remains their sole producer and broadcaster.
     #[allow(clippy::too_many_arguments)]
     fn block_reconstruction_dispatch(
-        mut messages_rx: mpsc::UnboundedReceiver<Message>,
+        mut messages_rx: mpsc::UnboundedReceiver<(u64, Message)>,
         broadcast_tx: broadcast::Sender<BroadcastedMessage>,
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
         processed_messages_max: usize,
+        msgid_gen: MessageId,
     ) {
         let processed_messages_max = processed_messages_max.max(1);
 
         let mut state =
-            BlockReconstructionState::new(None, replay_first_available_slot, replay_stored_slots);
+            BlockReconstructionState::new(None, replay_first_available_slot, replay_stored_slots)
+                .with_msgid_gen(msgid_gen);
         let mut processed_messages = Vec::with_capacity(processed_messages_max);
         let (_dummy_tx, dummy_rx) = mpsc::channel(1);
         let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(dummy_rx);
 
         loop {
             match messages_rx.try_recv() {
-                Ok(message) => {
-                    for item in state.on_message(message) {
-                        let DispatchItem { message, confirmed_messages, finalized_messages } = item;
-                        if matches!(&message.1, Message::Slot(_)) {
-                            // processed — flush immediately on every Slot message
-                            processed_messages.push(message);
-                            metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                            encode_messages(&processed_messages);
-                            let _ = broadcast_tx
-                                .send((CommitmentLevel::Processed, processed_messages.into()));
-                            processed_messages = Vec::with_capacity(processed_messages_max);
+                Ok((msgid, message)) => {
+                    #[cfg(test)]
+                    reconstruction_test_gate::wait_if_installed();
 
-                            // confirmed
-                            if let Some(confirmed_messages) = confirmed_messages {
-                                let _ = broadcast_tx
-                                    .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-                            }
+                    for item in state.on_message_with_id(msgid, message) {
+                        let DispatchItem {
+                            message,
+                            is_raw_message,
+                            confirmed_messages,
+                            finalized_messages,
+                        } = item;
 
-                            // finalized
-                            if let Some(finalized_messages) = finalized_messages {
-                                let _ = broadcast_tx
-                                    .send((CommitmentLevel::Finalized, finalized_messages.into()));
-                            }
-                        } else {
+                        if !is_raw_message {
+                            let is_slot = matches!(&message.1, Message::Slot(_));
                             processed_messages.push(message);
-                            if processed_messages.len() >= processed_messages_max
+                            if is_slot
+                                || processed_messages.len() >= processed_messages_max
                                 || confirmed_messages.is_some()
                                 || finalized_messages.is_some()
                             {
-                                metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                                encode_messages(&processed_messages);
-                                let _ = broadcast_tx
-                                    .send((CommitmentLevel::Processed, processed_messages.into()));
-                                processed_messages = Vec::with_capacity(processed_messages_max);
+                                flush_processed_batch(
+                                    &broadcast_tx,
+                                    &mut processed_messages,
+                                    processed_messages_max,
+                                );
                             }
+                        }
 
-                            if let Some(confirmed_messages) = confirmed_messages {
-                                let _ = broadcast_tx
-                                    .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-                            }
+                        if let Some(confirmed_messages) = confirmed_messages {
+                            let _ = broadcast_tx
+                                .send((CommitmentLevel::Confirmed, confirmed_messages.into()));
+                        }
 
-                            if let Some(finalized_messages) = finalized_messages {
-                                let _ = broadcast_tx
-                                    .send((CommitmentLevel::Finalized, finalized_messages.into()));
-                            }
+                        if let Some(finalized_messages) = finalized_messages {
+                            let _ = broadcast_tx
+                                .send((CommitmentLevel::Finalized, finalized_messages.into()));
                         }
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
-                    // Inbox drained — flush accumulated processed messages immediately
-                    if !processed_messages.is_empty() {
-                        metrics::GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                        encode_messages(&processed_messages);
-                        let _ = broadcast_tx
-                            .send((CommitmentLevel::Processed, processed_messages.into()));
-                        processed_messages = Vec::with_capacity(processed_messages_max);
-                    }
+                    // Inbox drained — flush accumulated derived-Processed messages immediately
+                    flush_processed_batch(
+                        &broadcast_tx,
+                        &mut processed_messages,
+                        processed_messages_max,
+                    );
 
                     // Service any pending replay requests while idle
                     if let Ok((commitment, replay_slot, tx)) = replay_stored_slots_rx.try_recv() {
@@ -1905,6 +2049,9 @@ mod tests {
                 }
                 DispatchKind::Dispatch => {
                     let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
+                    let msgid_gen = MessageId::default();
+                    let dispatch_msgid_gen = msgid_gen.clone();
+                    let dispatch_broadcast_tx = broadcast_tx.clone();
                     std::thread::spawn(move || {
                         GrpcService::block_reconstruction_dispatch(
                             reconstruction_rx,
@@ -1913,10 +2060,18 @@ mod tests {
                             Some(replay_slot_bg),
                             replay_stored_slots,
                             processed_messages_max,
+                            msgid_gen,
                         );
                     });
                     std::thread::spawn(move || {
-                        GrpcService::geyser_dispatch(messages_rx, None, reconstruction_tx);
+                        GrpcService::geyser_dispatch(
+                            messages_rx,
+                            None,
+                            reconstruction_tx,
+                            dispatch_broadcast_tx,
+                            dispatch_msgid_gen,
+                            processed_messages_max,
+                        );
                     });
                 }
             }
@@ -2264,9 +2419,20 @@ mod tests {
                 .unwrap();
 
             // Wait until slot 30's Finalized message has been fully processed
-            // (gc runs synchronously before any broadcast for that message).
+            // by the block-reconstruction thread (which is where gc runs).
+            // Post-decoupling, a Processed broadcast for this message no
+            // longer proves that: for DispatchKind::Dispatch, the raw
+            // message's Processed broadcast now comes from geyser_dispatch,
+            // independent of (and possibly before) the reconstruction
+            // thread's gc timing. Confirmed/Finalized broadcasts, however,
+            // are still produced solely by the reconstruction thread, after
+            // gc_finalized_slots runs — a reliable proxy under both
+            // DispatchKind::Loop and DispatchKind::Dispatch.
             loop {
-                let (_commitment, batch) = recv_broadcast(&mut rx).await;
+                let (commitment, batch) = recv_broadcast(&mut rx).await;
+                if commitment == CommitmentLevel::Processed {
+                    continue;
+                }
                 if batch.iter().any(|(_, m)| {
                     matches!(m, Message::Slot(s) if s.slot == 30 && s.status == SlotStatus::Finalized)
                 }) {
@@ -2486,6 +2652,9 @@ mod tests {
             let (messages_tx, messages_rx) = mpsc::unbounded_channel();
             let (broadcast_tx, _rx) = broadcast::channel::<BroadcastedMessage>(16);
             let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
+            let msgid_gen = MessageId::default();
+            let dispatch_msgid_gen = msgid_gen.clone();
+            let dispatch_broadcast_tx = broadcast_tx.clone();
 
             let reconstruction_handle = std::thread::spawn(move || {
                 GrpcService::block_reconstruction_dispatch(
@@ -2495,10 +2664,18 @@ mod tests {
                     None,
                     100,
                     1,
+                    msgid_gen,
                 );
             });
             let dispatch_handle = std::thread::spawn(move || {
-                GrpcService::geyser_dispatch(messages_rx, None, reconstruction_tx);
+                GrpcService::geyser_dispatch(
+                    messages_rx,
+                    None,
+                    reconstruction_tx,
+                    dispatch_broadcast_tx,
+                    dispatch_msgid_gen,
+                    1,
+                );
             });
 
             // Drop the plugin-facing sender: this is the only thing that
@@ -2530,6 +2707,356 @@ mod tests {
                 "block_reconstruction_dispatch did not exit after geyser_dispatch dropped its sender",
             )
             .expect("join task panicked");
+        }
+
+        // --- 9. Decoupling proof + reconnect-during-backpressure --------------
+        //
+        // Task 6b's actual goal: `geyser_dispatch`'s raw-Processed broadcast
+        // must not wait on the block-reconstruction thread's bookkeeping.
+        // These tests gate the reconstruction thread closed via
+        // `reconstruction_test_gate` (a `#[cfg(test)]`-only hook, unreachable
+        // from any non-test build) to prove it.
+
+        /// Spawns the same two-thread pipeline as
+        /// `spawn_dispatch(DispatchKind::Dispatch, ..)`, except the
+        /// reconstruction thread's per-item processing starts gated closed:
+        /// it will pull items off its inbound channel (so they queue up
+        /// there once it blocks on the first one) but do nothing with them
+        /// until the returned gate is released.
+        #[allow(clippy::type_complexity)]
+        fn spawn_dispatch_gated(
+            replay_stored_slots: u64,
+            processed_messages_max: usize,
+        ) -> (
+            mpsc::UnboundedSender<Message>,
+            broadcast::Sender<BroadcastedMessage>,
+            mpsc::Sender<ReplayStoredSlotsRequest>,
+            Arc<AtomicU64>,
+            Arc<reconstruction_test_gate::Gate>,
+        ) {
+            let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+            let (broadcast_tx, _rx) = broadcast::channel(1024);
+            let (replay_tx, replay_rx) = mpsc::channel(8);
+            let replay_first_available_slot = Arc::new(AtomicU64::new(u64::MAX));
+
+            let broadcast_tx_bg = broadcast_tx.clone();
+            let replay_slot_bg = Arc::clone(&replay_first_available_slot);
+
+            let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
+            let msgid_gen = MessageId::default();
+            let dispatch_msgid_gen = msgid_gen.clone();
+            let dispatch_broadcast_tx = broadcast_tx.clone();
+
+            let gate = reconstruction_test_gate::Gate::new_closed();
+            let gate_for_thread = Arc::clone(&gate);
+
+            std::thread::spawn(move || {
+                reconstruction_test_gate::install(gate_for_thread);
+                GrpcService::block_reconstruction_dispatch(
+                    reconstruction_rx,
+                    broadcast_tx_bg,
+                    Some(replay_rx),
+                    Some(replay_slot_bg),
+                    replay_stored_slots,
+                    processed_messages_max,
+                    msgid_gen,
+                );
+            });
+            std::thread::spawn(move || {
+                GrpcService::geyser_dispatch(
+                    messages_rx,
+                    None,
+                    reconstruction_tx,
+                    dispatch_broadcast_tx,
+                    dispatch_msgid_gen,
+                    processed_messages_max,
+                );
+            });
+
+            (
+                messages_tx,
+                broadcast_tx,
+                replay_tx,
+                replay_first_available_slot,
+                gate,
+            )
+        }
+
+        #[tokio::test]
+        async fn test_decoupling_processed_flows_without_waiting_on_gated_reconstruction() {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot, gate) = spawn_dispatch_gated(100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            // Slot N: a complete, sealing block. Sent while the
+            // reconstruction thread is already gated closed, so none of it
+            // is processed (gc/dedup/sealing) until the gate is released.
+            tx.send(make_block_meta(500, 1, 1)).unwrap();
+            tx.send(make_transaction(500, unique_signature(50)))
+                .unwrap();
+            tx.send(make_entry(500, 0)).unwrap();
+
+            // Slot N+1: fully disjoint, including two updates to the same
+            // pubkey (to check per-pubkey ordering under starvation).
+            let pubkey = Pubkey::new_unique();
+            tx.send(make_slot(501, Some(500), SlotStatus::Processed))
+                .unwrap();
+            tx.send(make_account(501, pubkey, 1)).unwrap();
+            tx.send(make_account(501, pubkey, 2)).unwrap();
+            tx.send(make_transaction(501, unique_signature(51)))
+                .unwrap();
+
+            // Collect Processed broadcasts until slot 501's 4 raw messages
+            // have all arrived, with a bounded overall timeout — proving
+            // they arrive without waiting on slot 500's sealed Block
+            // message, which cannot arrive at all while the gate is closed.
+            let mut msgids_501 = Vec::new();
+            let mut write_versions_501 = Vec::new();
+            let mut saw_block_500 = false;
+            for _ in 0..40 {
+                let Some((commitment, batch)) =
+                    try_recv_broadcast(&mut rx, Duration::from_secs(2)).await
+                else {
+                    break;
+                };
+                if commitment != CommitmentLevel::Processed {
+                    continue;
+                }
+                for (msgid, m) in batch.iter() {
+                    match m {
+                        Message::Block(b) if b.meta.slot == 500 => saw_block_500 = true,
+                        Message::Slot(s) if s.slot == 501 => msgids_501.push(*msgid),
+                        Message::Account(a) if a.slot == 501 && a.account.pubkey == pubkey => {
+                            msgids_501.push(*msgid);
+                            write_versions_501.push(a.account.write_version);
+                        }
+                        Message::Transaction(t) if t.slot == 501 => msgids_501.push(*msgid),
+                        _ => {}
+                    }
+                }
+                if msgids_501.len() >= 4 {
+                    break;
+                }
+            }
+
+            assert!(
+                !saw_block_500,
+                "slot 500's sealed Block message must not have arrived yet — \
+                 the reconstruction thread is still gated"
+            );
+            assert_eq!(
+                msgids_501.len(),
+                4,
+                "all of slot 501's raw messages should arrive on Processed while the \
+                 reconstruction thread is gated, got msgids {msgids_501:?}"
+            );
+            assert!(
+                msgids_501.windows(2).all(|w| w[0] < w[1]),
+                "slot 501's raw messages should arrive in strictly increasing msgid \
+                 order, got {msgids_501:?}"
+            );
+            assert_eq!(
+                write_versions_501,
+                vec![1, 2],
+                "same-pubkey account updates must still arrive in write_version order \
+                 while the reconstruction thread is starved"
+            );
+
+            let last_501_msgid = *msgids_501.last().unwrap();
+
+            // Release the gate: slot 500's sealed Block should now be
+            // delivered — late, but not dropped.
+            gate.release();
+
+            let mut block_500_msgid = None;
+            for _ in 0..50 {
+                let Some((commitment, batch)) =
+                    try_recv_broadcast(&mut rx, Duration::from_secs(2)).await
+                else {
+                    break;
+                };
+                if commitment != CommitmentLevel::Processed {
+                    continue;
+                }
+                for (msgid, m) in batch.iter() {
+                    if let Message::Block(b) = m {
+                        if b.meta.slot == 500 {
+                            block_500_msgid = Some(*msgid);
+                        }
+                    }
+                }
+                if block_500_msgid.is_some() {
+                    break;
+                }
+            }
+
+            let block_500_msgid = block_500_msgid.expect(
+                "slot 500's sealed Block message should eventually be delivered \
+                 after the gate is released (late, not dropped)",
+            );
+            // What this pins down, verified empirically here (not assumed):
+            // the Block message's msgid ends up *higher* than the
+            // already-delivered slot 501 raw msgids, not lower. `msgid_gen`
+            // is one shared, global monotonic counter; `geyser_dispatch`
+            // (never gated) mints ids for every raw message — including all
+            // of slot 501's, and even slot 500's own raw messages — eagerly,
+            // as they arrive, regardless of reconstruction-thread progress.
+            // The reconstruction thread only mints the *derived* Block
+            // message's id lazily, at the moment it actually processes the
+            // sealing message — which, under this gate, happens strictly
+            // after dispatch has already raced ahead and consumed ids for
+            // every raw message of both slots. So a message's position in
+            // the global msgid order no longer reflects "which slot it's
+            // about" once dispatch and the reconstruction thread are
+            // decoupled and the latter genuinely falls behind: only
+            // uniqueness and monotonicity (never reused, never issued out of
+            // order to the same caller) are preserved, not slot affinity.
+            assert!(
+                block_500_msgid > last_501_msgid,
+                "under this backpressure scenario the late Block message's msgid \
+                 ({block_500_msgid}) is expected to be higher than slot 501's raw \
+                 msgids (last: {last_501_msgid}) — see comment above"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_decoupling_confirmed_subscriber_still_gets_correct_slot_under_gate() {
+            let (tx, broadcast_tx, _replay_tx, _replay_slot, gate) = spawn_dispatch_gated(100, 1);
+            let mut rx = broadcast_tx.subscribe();
+
+            tx.send(make_block_meta(600, 1, 1)).unwrap();
+            tx.send(make_transaction(600, unique_signature(60)))
+                .unwrap();
+            tx.send(make_entry(600, 0)).unwrap();
+            tx.send(make_slot(600, Some(599), SlotStatus::Confirmed))
+                .unwrap();
+
+            // While the gate is closed, no Confirmed batch for slot 600 can
+            // possibly arrive (Confirmed is only ever produced by the
+            // reconstruction thread).
+            let early = try_recv_broadcast(&mut rx, Duration::from_millis(200)).await;
+            assert!(
+                !matches!(
+                    early,
+                    Some((CommitmentLevel::Confirmed, ref batch))
+                        if batch.iter().any(|(_, m)| m.get_slot() == 600)
+                ),
+                "no Confirmed batch for slot 600 should arrive while gated, got {early:?}"
+            );
+
+            gate.release();
+
+            let mut confirmed_kinds: HashSet<&'static str> = HashSet::new();
+            for _ in 0..50 {
+                let Some((commitment, batch)) =
+                    try_recv_broadcast(&mut rx, Duration::from_secs(2)).await
+                else {
+                    break;
+                };
+                if commitment != CommitmentLevel::Confirmed {
+                    continue;
+                }
+                for (_, m) in batch.iter() {
+                    if m.get_slot() != 600 {
+                        continue;
+                    }
+                    match m {
+                        Message::Transaction(_) => {
+                            confirmed_kinds.insert("Transaction");
+                        }
+                        Message::Block(_) => {
+                            confirmed_kinds.insert("Block");
+                        }
+                        Message::Slot(s) if s.status == SlotStatus::Confirmed => {
+                            confirmed_kinds.insert("Slot");
+                        }
+                        _ => {}
+                    }
+                }
+                if confirmed_kinds.contains("Block") {
+                    break;
+                }
+            }
+
+            assert!(
+                confirmed_kinds.contains("Slot")
+                    && confirmed_kinds.contains("Transaction")
+                    && confirmed_kinds.contains("Block"),
+                "a Confirmed subscriber should eventually receive the complete, \
+                 correct slot-600 set (raw Slot status, raw Transaction, and the \
+                 sealed Block) after the gate is released, got {confirmed_kinds:?}"
+            );
+        }
+
+        // --- 10. Reconnect-during-backpressure --------------------------------
+        //
+        // While the reconstruction thread is gated closed, a real `from_slot`
+        // replay request (via the actual `replay_stored_slots_tx`/oneshot
+        // plumbing) must block — not error, not resolve early — until the
+        // reconstruction thread's inbound channel drains and its idle branch
+        // services it from current BTreeMap state. This relocates today's
+        // existing degraded-mode behavior; it is not a new failure mode.
+        // Trade-off: raw Processed latency is now decoupled/near-instant,
+        // while `from_slot` replay freshness depends solely on the
+        // reconstruction thread's own backlog.
+
+        #[tokio::test]
+        async fn test_reconnect_replay_blocks_until_gated_reconstruction_drains() {
+            let (tx, _broadcast_tx, replay_tx, _replay_slot, gate) = spawn_dispatch_gated(100, 1);
+
+            tx.send(make_slot(700, Some(699), SlotStatus::Processed))
+                .unwrap();
+            tx.send(make_account(700, Pubkey::new_unique(), 1))
+                .unwrap();
+
+            // Give geyser_dispatch time to actually forward these into the
+            // (gated) reconstruction channel.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let (replay_reply_tx, mut replay_reply_rx) = oneshot::channel();
+            replay_tx
+                .send((CommitmentLevel::Processed, 700, replay_reply_tx))
+                .await
+                .expect("replay_stored_slots_tx should accept the request");
+
+            // The reconstruction thread is stuck processing (gated on) the
+            // first backlogged item, so it never even looks at
+            // replay_stored_slots_rx yet: the oneshot must still be pending.
+            // Poll non-consumingly via try_recv() so we can keep awaiting
+            // this exact same receiver below, rather than dropping it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                matches!(
+                    replay_reply_rx.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ),
+                "from_slot replay must still be pending while the reconstruction thread's \
+                 channel has an unprocessed backlog"
+            );
+
+            gate.release();
+
+            // Once released, the reconstruction thread drains its backlog,
+            // then its idle branch services the now-pending replay request
+            // from current (now-complete) BTreeMap state.
+            let response = tokio::time::timeout(Duration::from_secs(2), replay_reply_rx)
+                .await
+                .expect("replay request should resolve once the reconstruction thread drains")
+                .expect("oneshot sender should not be dropped");
+
+            match response {
+                ReplayedResponse::Messages(messages) => {
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|(_, m)| matches!(m, Message::Slot(s) if s.slot == 700)),
+                        "replay response should contain slot 700's messages once serviced \
+                         from the drained BTreeMap, got {messages:?}"
+                    );
+                }
+                ReplayedResponse::Lagged(slot) => {
+                    panic!("expected in-range replay messages for slot 700, got Lagged({slot})")
+                }
+            }
         }
     }
 }
