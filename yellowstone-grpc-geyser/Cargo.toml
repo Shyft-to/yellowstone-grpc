@@ -38,7 +38,6 @@ pin-project = { workspace = true }
 prometheus = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -103,6 +102,7 @@ vergen = { workspace = true, features = ["build", "rustc"] }
 bytes = { workspace = true }
 criterion = { workspace = true }
 prost_011 = { workspace = true }
+rayon = { workspace = true }
 solana-keypair = { workspace = true }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }

@@ -335,12 +335,6 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub replay_stored_slots: u64,
-    /// Number of threads for parallel encoding
-    #[serde(
-        default = "ConfigGrpc::encoder_threads_default",
-        deserialize_with = "deserialize_int_str"
-    )]
-    pub encoder_threads: usize,
     /// Maximum number of messages accumulated into one encoded batch before flushing.
     #[serde(
         default = "ConfigGrpc::processed_messages_max_default",
@@ -409,10 +403,6 @@ impl ConfigGrpc {
 
     const fn default_replay_stored_slots() -> u64 {
         150
-    }
-
-    const fn encoder_threads_default() -> usize {
-        4
     }
 
     const fn processed_messages_max_default() -> usize {
@@ -639,5 +629,25 @@ mod tests {
         let json = r#""not_valid""#;
         let result: Result<GrpcAddresses, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    /// `encoder_threads` was removed when the rayon-backed `ParallelEncoder` was replaced by
+    /// direct synchronous encoding. `ConfigGrpc` is `#[serde(deny_unknown_fields)]`, so an
+    /// operator config that still sets `encoder_threads` must fail to parse loudly rather than
+    /// silently ignoring the field.
+    #[test]
+    fn test_grpc_config_with_removed_encoder_threads_field_fails_to_parse() {
+        let json = r#"{
+            "address": "0.0.0.0:10000",
+            "tls_config": null,
+            "x_token": null,
+            "encoder_threads": 4
+        }"#;
+        let result: Result<super::ConfigGrpc, _> = serde_json::from_str(json);
+        let err = result.expect_err("encoder_threads should no longer be a recognized field");
+        assert!(
+            err.to_string().contains("encoder_threads"),
+            "error should mention the unknown field, got: {err}"
+        );
     }
 }
