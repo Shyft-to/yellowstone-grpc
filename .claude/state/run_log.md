@@ -164,7 +164,7 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | # | Task | Status | Attempts | Last Verdict | Commit |
 |---|------|--------|----------|---------------|--------|
 | 1 | Remove ParallelEncoder, direct synchronous encode_messages() | DONE | 2 | APPROVED | 7b7867b |
-| 2 | jemalloc as global allocator | IN_PROGRESS | 1 | - | - |
+| 2 | jemalloc as global allocator | DONE | 1 | APPROVED | pending |
 | 3 | Filter foldhash + per-connection FilterNames | PENDING | 0 | - | - |
 | 4 | Characterization tests (regression net, test-only) | PENDING | 0 | - | - |
 | 5 | Pure extraction refactor: block_reconstruction.rs | PENDING | 0 | - | - |
@@ -173,6 +173,9 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 6c | Shutdown/join wiring | PENDING | 0 | - | - |
 
 ## Task Notes
+
+### Task 2, attempt 1 — APPROVED (validator agent id ac160c625df5efb0d)
+Confirmed `tikv-jemallocator = "0.6.1"` genuinely present in root Cargo.toml workspace deps; `workspace = true` + additive `features = [...]` is valid Cargo syntax, verified via `cargo tree -e features` that `disable_initial_exec_tls` actually resolved. Ran `nm`/`strings` on the built `.dylib` and found 438 `__rjem_je_*` jemalloc symbols + jemalloc error strings linked in — confirms real runtime wiring, not a no-op. lib.rs hunk byte-for-byte identical to master's 1453f2c. Tests 58/58 pass, release build clean. No findings.
 
 ### Task 1, attempt 2 — APPROVED (validator agent id ae350be75b2abe9a4)
 Zero code changes from attempt 1 (already-approved diff), only the report was corrected. Independently re-ran the benchmark a third time: direction confirmed at all 5 batch sizes including the critical batch-256 flip toward rayon_parallel (~1.66x faster in this run, vs executor's ~1.125x — magnitudes noisy under this dev machine's background load, but direction consistent across 3 independent runs total). Verified `processed_messages_max` default is genuinely 31. One precision correction to the executor's reasoning (non-blocking, doesn't change verdict): batch size is hard-capped at `processed_messages_max` on every push/flush check (verified in grpc.rs) — so 256-sized batches aren't a "backlog/catch-up" phenomenon as the executor framed it, they require an explicit operator override of `processed_messages_max >= ~256`, an even stronger argument for proceeding since 256 is structurally unreachable under default config. Approved.
