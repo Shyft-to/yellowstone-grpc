@@ -167,7 +167,7 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 2 | jemalloc as global allocator | DONE | 1 | APPROVED | 17d7290 |
 | 3 | Filter foldhash + per-connection FilterNames | DONE | 2 | APPROVED | 4700fbd |
 | 4 | Characterization tests (regression net, test-only) | DONE | 1 | APPROVED | pending |
-| 5 | Pure extraction refactor: block_reconstruction.rs | IN_PROGRESS | 2 | REJECTED (attempt 1) | - |
+| 5 | Pure extraction refactor: block_reconstruction.rs | IN_PROGRESS | 2 | pending re-validation | - |
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
 | 6b | The decoupling: geyser_dispatch broadcasts raw Processed directly (the latency win) | PENDING | 0 | - | - |
 | 6c | Shutdown/join wiring | PENDING | 0 | - | - |
