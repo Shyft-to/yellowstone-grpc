@@ -601,6 +601,22 @@ impl GrpcService {
         }
 
         if let Some(cpu_core) = config.geyser_dispatch_cpu_core {
+            let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
+
+            std::thread::Builder::new()
+                .name("block-reconstruction".into())
+                .spawn(move || {
+                    Self::block_reconstruction_dispatch(
+                        reconstruction_rx,
+                        broadcast_tx,
+                        replay_stored_slots_rx,
+                        replay_first_available_slot,
+                        config.replay_stored_slots,
+                        config.processed_messages_max,
+                    );
+                })
+                .expect("failed to spawn block-reconstruction thread");
+
             std::thread::Builder::new()
                 .name("geyser-dispatch".into())
                 .spawn(move || {
@@ -608,15 +624,7 @@ impl GrpcService {
                     {
                         log::warn!("geyser-dispatch: failed to pin to CPU {cpu_core}: {e}");
                     }
-                    Self::geyser_dispatch(
-                        messages_rx,
-                        blocks_meta_tx,
-                        broadcast_tx,
-                        replay_stored_slots_rx,
-                        replay_first_available_slot,
-                        config.replay_stored_slots,
-                        config.processed_messages_max,
-                    );
+                    Self::geyser_dispatch(messages_rx, blocks_meta_tx, reconstruction_tx);
                 })
                 .expect("failed to spawn geyser-dispatch thread");
         } else {
@@ -783,13 +791,54 @@ impl GrpcService {
         info!("Geyser loop exiting");
     }
 
-    /// Spin-loop variant of geyser_loop for use on a dedicated std::thread with CPU pinning.
-    /// Eliminates the 10ms batch-window timer and tokio scheduler wake latency by using
-    /// try_recv() and flushing whenever the inbox is momentarily empty.
-    #[allow(clippy::too_many_arguments)]
+    /// Pure forwarder from the plugin-facing inbound channel to the
+    /// block-reconstruction thread's channel. Runs on a dedicated,
+    /// CPU-pinned std::thread and spin-loops via try_recv() to avoid tokio
+    /// scheduler wake latency. Owns no bookkeeping of its own: the only
+    /// thing it does besides forwarding is the blocks_meta_tx passthrough
+    /// for Slot/BlockMeta messages, which is independent of the BTreeMap
+    /// bookkeeping the reconstruction thread owns.
     fn geyser_dispatch(
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
+        reconstruction_tx: mpsc::UnboundedSender<Message>,
+    ) {
+        loop {
+            match messages_rx.try_recv() {
+                Ok(message) => {
+                    if let Some(blocks_meta_tx) = &blocks_meta_tx {
+                        if matches!(&message, Message::Slot(_) | Message::BlockMeta(_)) {
+                            let _ = blocks_meta_tx.send(message.clone());
+                        }
+                    }
+                    if reconstruction_tx.send(message).is_err() {
+                        info!("Geyser dispatch: block-reconstruction channel closed");
+                        break;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    std::hint::spin_loop();
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    info!("Geyser dispatch: messages channel closed");
+                    break;
+                }
+            }
+        }
+
+        info!("Geyser dispatch thread exiting");
+    }
+
+    /// Owns the `BlockReconstructionState` (BTreeMap bookkeeping, gc,
+    /// sealing, replay buffer) and the batching/encode/broadcast for all
+    /// three commitment levels. Runs on its own dedicated std::thread (fed
+    /// by `geyser_dispatch`'s forwarding channel), deliberately *not*
+    /// CPU-pinned. Otherwise identical in behavior to the pre-split
+    /// `geyser_dispatch` spin-loop: uses try_recv() and flushes accumulated
+    /// processed messages whenever the inbox is momentarily empty.
+    #[allow(clippy::too_many_arguments)]
+    fn block_reconstruction_dispatch(
+        mut messages_rx: mpsc::UnboundedReceiver<Message>,
         broadcast_tx: broadcast::Sender<BroadcastedMessage>,
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
@@ -798,11 +847,8 @@ impl GrpcService {
     ) {
         let processed_messages_max = processed_messages_max.max(1);
 
-        let mut state = BlockReconstructionState::new(
-            blocks_meta_tx,
-            replay_first_available_slot,
-            replay_stored_slots,
-        );
+        let mut state =
+            BlockReconstructionState::new(None, replay_first_available_slot, replay_stored_slots);
         let mut processed_messages = Vec::with_capacity(processed_messages_max);
         let (_dummy_tx, dummy_rx) = mpsc::channel(1);
         let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(dummy_rx);
@@ -875,13 +921,13 @@ impl GrpcService {
                     std::hint::spin_loop();
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    info!("Geyser dispatch: messages channel closed");
+                    info!("Block reconstruction: channel closed");
                     break;
                 }
             }
         }
 
-        info!("Geyser dispatch thread exiting");
+        info!("Block reconstruction thread exiting");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1822,10 +1868,11 @@ mod tests {
             Dispatch,
         }
 
-        /// Spawns either `geyser_loop` (on the current tokio runtime) or
-        /// `geyser_dispatch` (on a dedicated OS thread, mirroring how
-        /// `GrpcService::create` wires it for CPU-pinned deployments) and
-        /// returns the channels needed to drive and observe it.
+        /// Spawns either `geyser_loop` (on the current tokio runtime) or the
+        /// `geyser_dispatch` + `block_reconstruction_dispatch` two-thread
+        /// pipeline (mirroring how `GrpcService::create` wires it for
+        /// CPU-pinned deployments, minus the CPU pinning itself) and returns
+        /// the channels needed to drive and observe it.
         fn spawn_dispatch(
             kind: DispatchKind,
             replay_stored_slots: u64,
@@ -1857,16 +1904,19 @@ mod tests {
                     ));
                 }
                 DispatchKind::Dispatch => {
+                    let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
                     std::thread::spawn(move || {
-                        GrpcService::geyser_dispatch(
-                            messages_rx,
-                            None,
+                        GrpcService::block_reconstruction_dispatch(
+                            reconstruction_rx,
                             broadcast_tx_bg,
                             Some(replay_rx),
                             Some(replay_slot_bg),
                             replay_stored_slots,
                             processed_messages_max,
                         );
+                    });
+                    std::thread::spawn(move || {
+                        GrpcService::geyser_dispatch(messages_rx, None, reconstruction_tx);
                     });
                 }
             }
@@ -2420,6 +2470,66 @@ mod tests {
         #[tokio::test]
         async fn test_live_ordering_backfill_dispatch() {
             run_live_ordering_backfill(DispatchKind::Dispatch).await;
+        }
+
+        // --- 8. Shutdown propagation across the two-thread pipeline -----------
+        //
+        // Precursor check for Task 6c's full join wiring: dropping the
+        // sender feeding `geyser_dispatch`'s inbound channel should make
+        // `geyser_dispatch` observe a disconnected channel, exit its loop,
+        // and (by dropping its own sender into the block-reconstruction
+        // channel) cause `block_reconstruction_dispatch` to observe the same
+        // and exit too. Neither thread should hang waiting on the other.
+
+        #[tokio::test]
+        async fn test_dispatch_shutdown_propagates_to_reconstruction_thread() {
+            let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+            let (broadcast_tx, _rx) = broadcast::channel::<BroadcastedMessage>(16);
+            let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
+
+            let reconstruction_handle = std::thread::spawn(move || {
+                GrpcService::block_reconstruction_dispatch(
+                    reconstruction_rx,
+                    broadcast_tx,
+                    None,
+                    None,
+                    100,
+                    1,
+                );
+            });
+            let dispatch_handle = std::thread::spawn(move || {
+                GrpcService::geyser_dispatch(messages_rx, None, reconstruction_tx);
+            });
+
+            // Drop the plugin-facing sender: this is the only thing that
+            // keeps `geyser_dispatch`'s loop alive.
+            drop(messages_tx);
+
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || {
+                    dispatch_handle
+                        .join()
+                        .expect("geyser_dispatch thread panicked")
+                }),
+            )
+            .await
+            .expect("geyser_dispatch did not exit after its inbound channel closed")
+            .expect("join task panicked");
+
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || {
+                    reconstruction_handle
+                        .join()
+                        .expect("block_reconstruction_dispatch thread panicked")
+                }),
+            )
+            .await
+            .expect(
+                "block_reconstruction_dispatch did not exit after geyser_dispatch dropped its sender",
+            )
+            .expect("join task panicked");
         }
     }
 }
