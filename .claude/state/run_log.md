@@ -70,6 +70,21 @@
 
   Open questions re-raised for evaluator: std::thread vs tokio-runtime-per-thread (still no explicit blessing, asking directly); blocks_meta_tx staying in dispatch vs moving to reconstruction thread; whether task 1's microbench is a hard requirement or written reasoning suffices if time-constrained; jemalloc/cdylib/host-process interaction remains unverifiable outside live validator (carried over, unchanged).
 
+- Evaluator verdict: REJECTED (agent id ad1c138a76001acf6)
+- Evaluator feedback:
+  Verification performed: re-read client_loop live/replay branches, missed-status backfill logic, write_version/dedup ordering, diffed master's f7087d3/2146785. Confirmed correct: (1) backfill ancestors ARE broadcast in msgid-decreasing order via `.rev()` over messages_vec (grpc.rs:999/1370) — planner's claim verified accurate. (2) raw Processed push (grpc.rs:901/1268) happens unconditionally before dedup-nulling, which only mutates the stored/replay/Confirmed/Finalized snapshot array, never the live raw Processed broadcast — planner's invariant sound. (3) client_loop live branch discards msgid entirely, no cross-slot/cross-channel ordering dependency — confirmed.
+
+  **New blocking gap found**: `geyser_dispatch`'s BTreeMap is not only bookkeeping — it's also the sole data source for `replay_stored_slots_rx`/`replay_first_available_slot` servicing (grpc.rs:1497-1519 in geyser_dispatch, 1107-1127 in geyser_loop), which backs the production `from_slot` auto-reconnect feature. Neither round's Task 6 said what happens to these when the BTreeMap moves to the reconstruction thread, nor updated `GrpcService::create`'s spawn wiring (grpc.rs:685-704) accordingly. This is not speculative: master's own cited reference commit 2146785 had to solve exactly this (block_reconstruction_loop's signature explicitly takes replay_stored_slots_rx/replay_first_available_slot, moved out of the thinner geyser_loop) — the plan cites this commit by hash but missed that it already solved this problem. Consequences if unaddressed: executor silently improvises during 6a coding, or from_slot replay breaks/points at stale state. Also interacts with backpressure: once decoupled, a reconnecting client's from_slot replay is serviced by the reconstruction thread and can lag behind live Processed traffic in a way it structurally couldn't before — plausibly acceptable but must be stated/tested, not implicit.
+
+  Required for round 3:
+  1. Task 6a must explicitly state replay_stored_slots_rx/replay_first_available_slot move to the reconstruction thread (matching master's 2146785 precedent) and update GrpcService::create spawn wiring (grpc.rs:685-704) accordingly. Add as concrete deliverable with test: from_slot replay correctness identical pre/post (can extend Task 4's existing replay-buffer-servicing characterization test).
+  2. Task 6b's backpressure test suite needs a reconnect-during-backpressure case: while reconstruction thread is gated/paused, a client sends from_slot replay request — assert explicit chosen behavior (blocks/delays proportionally then correct on release, or whatever is chosen) rather than leaving unstated. State the trade-off explicitly: replay latency now decoupled from raw Processed latency (previously coupled via single-thread backlog).
+  3. Resolve remaining open questions definitively, don't re-raise a third time: bless std::thread over tokio-runtime-per-thread (justification: try_recv/recv/oneshot::send need no active runtime, proven by today's geyser_dispatch already doing exactly this without one) — drop as open question. Confirm blocks_meta_tx stays in dispatch (no BTreeMap dependency, no correctness impact) — drop as open question.
+  4. Make Task 1's Criterion microbenchmark a hard requirement, not time-permitting — hot-path throughput trade-off with medium risk by the plan's own admission.
+  5. No further concerns on Task 4/5 sequencing, 6a/6b/6c split granularity, or live-ordering reasoning — sound and well-evidenced.
+
+### Round 3
+- Planner output: (pending)
 - Evaluator verdict: (pending)
 - Evaluator feedback: (pending)
 
