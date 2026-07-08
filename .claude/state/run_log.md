@@ -10,7 +10,7 @@
   Goal: reduce end-to-end and tail latency of gRPC fan-out without regressing correctness of block reconstruction (duplicate slot handling, gc timing, confirmed/finalized ordering) or existing config/API compatibility.
 - Base branch: i2
 - Feature branch: implement/port-master-latency-opts
-- Status: EXECUTING
+- Status: DONE
 - Started: 2026-07-08
 - Last updated: 2026-07-08
 
@@ -170,9 +170,14 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 5 | Pure extraction refactor: block_reconstruction.rs | DONE | 3 | APPROVED | pending |
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | DONE | 1 | APPROVED | pending |
 | 6b | The decoupling: geyser_dispatch broadcasts raw Processed directly (the latency win) | DONE | 1 | APPROVED | pending |
-| 6c | Shutdown/join wiring | IN_PROGRESS | 1 | - | - |
+| 6c | Shutdown/join wiring | DONE | 1 | APPROVED | pending |
 
 ## Task Notes
+
+### Task 6c, attempt 1 — APPROVED (validator agent id a3e240d05a09d5893), final task of the run
+Confirmed the extracted `spawn_dispatch_threads` is a pure relocation (same CPU-affinity call, thread names, channel construction, closures) via direct diff. Confirmed only one call site of `GrpcService::create` exists, correctly destructures the new 3-tuple, `None` case (async geyser_loop fallback) is guarded with `if let Some(...)` in on_unload, no unwrap-on-None. Traced the shutdown propagation chain by reading the actual function bodies end-to-end: drop(grpc_channel) -> geyser_dispatch's try_recv sees Disconnected -> thread breaks, drops its reconstruction_tx -> block_reconstruction_dispatch's try_recv sees Disconnected -> exits. Confirmed Task 6a's shutdown test was genuinely untouched by this diff and already used the (u64, Message) type (the "needed no changes" claim checks out, not just asserted). Confirmed the on_unload join pattern faithfully replicates the pre-Task-1 encoder_handle precedent (same drop->shutdown_timeout->join->log::error!-on-panic shape). 90/90 tests across 4 full runs + 5 isolated reruns of both shutdown-sensitive tests, no flakiness. Clean release build, clippy -D warnings, workspace check. No findings beyond the already-on-record pre-existing harness-file dirty state (non-blocking since Task 1).
+
+**All 8 tasks of run implement/port-master-latency-opts are now approved.**
 
 ### Task 6b, attempt 1 — APPROVED (validator agent id a55954a854cafe5c6)
 The core latency-earning task, approved on first attempt with two executor-reported deviations from the plan's exact predictions, both independently re-derived (not trusted) by the validator:

@@ -526,6 +526,18 @@ impl interceptor::Interceptor for XTokenInterceptor {
     }
 }
 
+/// `JoinHandle`s for the CPU-pinned `geyser-dispatch`/`block-reconstruction`
+/// thread pair, returned by `GrpcService::create` so the plugin can join
+/// them cleanly at shutdown instead of leaving them to become orphaned.
+/// `None` when `geyser_dispatch_cpu_core` is unset and the async
+/// `geyser_loop` fallback (a `task_tracker`-managed tokio task, already
+/// joined via `task_tracker`/`runtime.shutdown_timeout`) is used instead.
+#[derive(Debug)]
+pub struct DispatchThreadHandles {
+    pub geyser_dispatch: std::thread::JoinHandle<()>,
+    pub block_reconstruction: std::thread::JoinHandle<()>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GrpcService {
     config_snapshot_client_channel_capacity: usize,
@@ -559,6 +571,7 @@ impl GrpcService {
     ) -> anyhow::Result<(
         Option<crossbeam_channel::Sender<Box<Message>>>,
         mpsc::UnboundedSender<Message>,
+        Option<DispatchThreadHandles>,
     )> {
         // Bind all configured addresses (TCP or Unix domain socket)
         let mut listeners = Vec::new();
@@ -688,51 +701,17 @@ impl GrpcService {
         let processed_messages_max = config.processed_messages_max;
         let replay_stored_slots = config.replay_stored_slots;
 
-        if let Some(cpu_core) = config.geyser_dispatch_cpu_core {
-            let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
-
-            // One shared, atomic-backed id space: geyser_dispatch mints ids
-            // for raw messages, the reconstruction thread mints ids for
-            // what it synthesizes (sealed Block, backfilled ancestor Slot
-            // messages) — both must agree on one monotonic space for
-            // client_loop's replay-path sort_by_key to stay correct now
-            // that they're independent broadcasters.
-            let msgid_gen = MessageId::default();
-            let dispatch_msgid_gen = msgid_gen.clone();
-            let dispatch_broadcast_tx = broadcast_tx.clone();
-
-            std::thread::Builder::new()
-                .name("block-reconstruction".into())
-                .spawn(move || {
-                    Self::block_reconstruction_dispatch(
-                        reconstruction_rx,
-                        broadcast_tx,
-                        replay_stored_slots_rx,
-                        replay_first_available_slot,
-                        replay_stored_slots,
-                        processed_messages_max,
-                        msgid_gen,
-                    );
-                })
-                .expect("failed to spawn block-reconstruction thread");
-
-            std::thread::Builder::new()
-                .name("geyser-dispatch".into())
-                .spawn(move || {
-                    if let Err(e) = crate::util::cpu_core_affinity::set_thread_affinity(&[cpu_core])
-                    {
-                        log::warn!("geyser-dispatch: failed to pin to CPU {cpu_core}: {e}");
-                    }
-                    Self::geyser_dispatch(
-                        messages_rx,
-                        blocks_meta_tx,
-                        reconstruction_tx,
-                        dispatch_broadcast_tx,
-                        dispatch_msgid_gen,
-                        processed_messages_max,
-                    );
-                })
-                .expect("failed to spawn geyser-dispatch thread");
+        let dispatch_threads = if let Some(cpu_core) = config.geyser_dispatch_cpu_core {
+            Some(Self::spawn_dispatch_threads(
+                cpu_core,
+                messages_rx,
+                blocks_meta_tx,
+                broadcast_tx,
+                replay_stored_slots_rx,
+                replay_first_available_slot,
+                replay_stored_slots,
+                processed_messages_max,
+            ))
         } else {
             task_tracker.spawn(async move {
                 Self::geyser_loop(
@@ -746,7 +725,8 @@ impl GrpcService {
                 )
                 .await;
             });
-        }
+            None
+        };
 
         // Health check service
         let (health_reporter, health_service) = health_reporter();
@@ -791,7 +771,73 @@ impl GrpcService {
             });
         }
 
-        Ok((snapshot_tx, messages_tx))
+        Ok((snapshot_tx, messages_tx, dispatch_threads))
+    }
+
+    /// Spawns the CPU-pinned `geyser-dispatch`/`block-reconstruction`
+    /// thread pair exactly as `GrpcService::create` wires them for
+    /// `geyser_dispatch_cpu_core`-configured deployments, returning their
+    /// `JoinHandle`s. Extracted into its own function so `create()` and its
+    /// shutdown-wiring tests exercise the identical spawn code.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_dispatch_threads(
+        cpu_core: usize,
+        messages_rx: mpsc::UnboundedReceiver<Message>,
+        blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
+        broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
+        replay_first_available_slot: Option<Arc<AtomicU64>>,
+        replay_stored_slots: u64,
+        processed_messages_max: usize,
+    ) -> DispatchThreadHandles {
+        let (reconstruction_tx, reconstruction_rx) = mpsc::unbounded_channel();
+
+        // One shared, atomic-backed id space: geyser_dispatch mints ids for
+        // raw messages, the reconstruction thread mints ids for what it
+        // synthesizes (sealed Block, backfilled ancestor Slot messages) —
+        // both must agree on one monotonic space for client_loop's
+        // replay-path sort_by_key to stay correct now that they're
+        // independent broadcasters.
+        let msgid_gen = MessageId::default();
+        let dispatch_msgid_gen = msgid_gen.clone();
+        let dispatch_broadcast_tx = broadcast_tx.clone();
+
+        let block_reconstruction = std::thread::Builder::new()
+            .name("block-reconstruction".into())
+            .spawn(move || {
+                Self::block_reconstruction_dispatch(
+                    reconstruction_rx,
+                    broadcast_tx,
+                    replay_stored_slots_rx,
+                    replay_first_available_slot,
+                    replay_stored_slots,
+                    processed_messages_max,
+                    msgid_gen,
+                );
+            })
+            .expect("failed to spawn block-reconstruction thread");
+
+        let geyser_dispatch = std::thread::Builder::new()
+            .name("geyser-dispatch".into())
+            .spawn(move || {
+                if let Err(e) = crate::util::cpu_core_affinity::set_thread_affinity(&[cpu_core]) {
+                    log::warn!("geyser-dispatch: failed to pin to CPU {cpu_core}: {e}");
+                }
+                Self::geyser_dispatch(
+                    messages_rx,
+                    blocks_meta_tx,
+                    reconstruction_tx,
+                    dispatch_broadcast_tx,
+                    dispatch_msgid_gen,
+                    processed_messages_max,
+                );
+            })
+            .expect("failed to spawn geyser-dispatch thread");
+
+        DispatchThreadHandles {
+            geyser_dispatch,
+            block_reconstruction,
+        }
     }
 
     async fn geyser_loop(
@@ -3057,6 +3103,63 @@ mod tests {
                     panic!("expected in-range replay messages for slot 700, got Lagged({slot})")
                 }
             }
+        }
+
+        // --- 10. Task 6c: clean shutdown of the `GrpcService::create`-level
+        //         thread-spawn wiring ---------------------------------------
+        //
+        // Drives `GrpcService::spawn_dispatch_threads` directly — the exact
+        // function `GrpcService::create` calls for CPU-pinned deployments —
+        // rather than a hand-rolled mirror of it, so this test proves the
+        // real production spawn/join wiring, not a reimplementation of it.
+
+        #[tokio::test]
+        async fn test_spawn_dispatch_threads_join_cleanly_on_shutdown() {
+            let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+            let (broadcast_tx, _rx) = broadcast::channel::<BroadcastedMessage>(16);
+
+            let handles = GrpcService::spawn_dispatch_threads(
+                0,
+                messages_rx,
+                None,
+                broadcast_tx,
+                None,
+                None,
+                100,
+                1,
+            );
+
+            // Feed a couple of in-flight messages, then simulate plugin
+            // shutdown by dropping the sender that feeds geyser_dispatch's
+            // inbound channel (mirrors `on_unload` dropping `grpc_channel`).
+            // In-flight messages may or may not be observed before the
+            // channel closes — this test only asserts a clean, bounded-time
+            // exit, matching geyser_dispatch's own pre-existing (not
+            // retroactively fixed) shutdown semantics.
+            messages_tx
+                .send(make_slot(1, None, SlotStatus::Processed))
+                .unwrap();
+            drop(messages_tx);
+
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || {
+                    handles
+                        .geyser_dispatch
+                        .join()
+                        .expect("geyser-dispatch thread panicked");
+                    handles
+                        .block_reconstruction
+                        .join()
+                        .expect("block-reconstruction thread panicked");
+                }),
+            )
+            .await
+            .expect(
+                "geyser-dispatch/block-reconstruction threads did not join within the \
+                 bounded timeout after shutdown",
+            )
+            .expect("join task panicked");
         }
     }
 }
