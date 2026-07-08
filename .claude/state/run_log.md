@@ -84,7 +84,24 @@
   5. No further concerns on Task 4/5 sequencing, 6a/6b/6c split granularity, or live-ordering reasoning — sound and well-evidenced.
 
 ### Round 3
-- Planner output: (pending)
+- Planner output (agent id a9a3722047b396780):
+
+  All round-2 required points addressed. **Task 6a rewritten**: now explicitly moves `replay_stored_slots_rx`/`replay_first_available_slot` to the reconstruction thread (matching master's 2146785 precedent), updates `GrpcService::create` spawn wiring (grpc.rs:685-719, re-verified), reconstruction thread does everything post-receive (assign msgid, on_message, batch/encode/broadcast ALL commitment levels incl. Processed, service_replay) — zero latency win yet, pure ownership-transfer. Test: extend Task 4's replay-servicing characterization test to run twice (pre-6a baseline vs post-6a two-thread pipeline via real GrpcService::create wiring), asserting byte-identical ReplayedResponse for same injected sequence+query.
+
+  **Task 5 extended** (small, in-scope): BlockReconstructionState also exposes `service_replay(...)` lifting today's replay-servicing logic (grpc.rs:1497-1519/1107-1127) verbatim as a callable method, so Task 6a's wiring work has zero replay-logic risk of its own — it only relocates which thread calls the method, never changes the method.
+
+  **Task 6b**: introduces shared atomic-backed MessageId (Arc<AtomicU64>, fetch_add) since both threads mint ids after this step (dispatch for raw messages, reconstruction thread for derived sealed-Block/missed-status-Slot messages via try_seal/msgid_gen.next() at grpc.rs:309,993/1364) — required for sort_by_key correctness. Channel type changes Message -> (u64, Message). Dispatch stops forwarding-only, now itself batches/encodes/broadcasts raw Processed directly (the actual win); reconstruction thread stops broadcasting raw Processed, keeps Confirmed/Finalized/derived-Processed-only. Live-ordering relaxation restated unchanged from round 2 (evaluator already verified correct).
+
+  **New: reconnect-during-backpressure test with concrete chosen behavior**: while reconstruction thread gated/paused, inject real from_slot replay request via replay_stored_slots_tx/oneshot (not mocked) — chosen behavior: request blocks (oneshot doesn't resolve) until reconstruction thread's channel drains to empty and its idle-branch reaches the pending request, then services from current BTreeMap state (correct, possibly delayed) — zero new correctness logic, just relocated existing mechanism, test proves timing characteristic only. Trade-off stated explicitly: previously raw-Processed latency and from_slot replay freshness were coupled to same single spin-loop backlog; after 6b, raw Processed is decoupled/near-instant while replay freshness depends solely on reconstruction thread's independent backlog — judged acceptable since from_slot reconnect isn't the latency-sensitive path this effort targets, but should be monitored (channel-depth gauge suggested as follow-up, not scoped as a task here).
+
+  **Both open questions resolved as settled, not reopened**: std::thread (evaluator-blessed, cited justification), blocks_meta_tx stays in dispatch (evaluator-confirmed, pure pass-through no BTreeMap dependency).
+
+  **Task 1 microbenchmark now a hard requirement**: extend existing benches/encode.rs (already wired into Cargo.toml under bench feature, no new [[bench]] target needed) comparing rayon-parallel encode_blocking vs sequential encode_messages at batch sizes 1/4/16/64/256; must be run and results reported before task considered done — if sequential meaningfully slower at realistic batch sizes (per GEYSER_BATCH_SIZE histogram), flag back rather than silently accept regression.
+
+  Non-goals/settled items carried over unchanged from round 2 (BlockMachineStorage crate, tokio-runtime-per-thread, splitting async geyser_loop, FilterAccountAggregate restructuring, Bytes->Vec<u8> changes, CPU-pinning new thread, unbounded channel by design, not retroactively joining geyser_dispatch's own handle).
+
+  Remaining open items (not blocking, flagged for evaluator): Task 1 microbench result unknown until run; jemalloc/cdylib/host-process interaction unverifiable outside live validator (carried over); reconstruction-channel-depth monitoring gauge suggested as natural follow-up, not scoped as a task — evaluator asked to confirm in/out of scope explicitly.
+
 - Evaluator verdict: (pending)
 - Evaluator feedback: (pending)
 
