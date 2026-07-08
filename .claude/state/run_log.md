@@ -165,7 +165,7 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 |---|------|--------|----------|---------------|--------|
 | 1 | Remove ParallelEncoder, direct synchronous encode_messages() | DONE | 2 | APPROVED | 7b7867b |
 | 2 | jemalloc as global allocator | DONE | 1 | APPROVED | 17d7290 |
-| 3 | Filter foldhash + per-connection FilterNames | IN_PROGRESS | 1 | - | - |
+| 3 | Filter foldhash + per-connection FilterNames | IN_PROGRESS | 2 | REJECTED (attempt 1) | - |
 | 4 | Characterization tests (regression net, test-only) | PENDING | 0 | - | - |
 | 5 | Pure extraction refactor: block_reconstruction.rs | PENDING | 0 | - | - |
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
@@ -173,6 +173,9 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 6c | Shutdown/join wiring | PENDING | 0 | - | - |
 
 ## Task Notes
+
+### Task 3, attempt 1 — REJECTED (validator agent id a36e569d57ee7081a)
+Part A/B mostly correct and well-tested (60 tests pass, foldhash retype confirmed complete for the fields it touched, FilterNames de-sharing confirmed coherent with no residual Arc/Mutex, both new name.rs tests confirmed substantive not tautological). **Blocking finding**: `nonempty_txn_signature_required` (filter.rs) was left on std HashSet while its structural siblings `account_required`/`owner_required` were retyped to FoldHashSet — all three live in the same FilterAccounts struct, populated identically at construction, queried identically per-filter-per-message in get_filters(). No basis for treating it differently; fix is a straightforward retype + 2 insert-site updates, same pattern as the other two. Everything else approved as-is.
 
 ### Task 2, attempt 1 — APPROVED (validator agent id ac160c625df5efb0d)
 Confirmed `tikv-jemallocator = "0.6.1"` genuinely present in root Cargo.toml workspace deps; `workspace = true` + additive `features = [...]` is valid Cargo syntax, verified via `cargo tree -e features` that `disable_initial_exec_tls` actually resolved. Ran `nm`/`strings` on the built `.dylib` and found 438 `__rjem_je_*` jemalloc symbols + jemalloc error strings linked in — confirms real runtime wiring, not a no-op. lib.rs hunk byte-for-byte identical to master's 1453f2c. Tests 58/58 pass, release build clean. No findings.
