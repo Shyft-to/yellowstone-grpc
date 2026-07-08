@@ -164,8 +164,8 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | # | Task | Status | Attempts | Last Verdict | Commit |
 |---|------|--------|----------|---------------|--------|
 | 1 | Remove ParallelEncoder, direct synchronous encode_messages() | DONE | 2 | APPROVED | 7b7867b |
-| 2 | jemalloc as global allocator | DONE | 1 | APPROVED | pending |
-| 3 | Filter foldhash + per-connection FilterNames | PENDING | 0 | - | - |
+| 2 | jemalloc as global allocator | DONE | 1 | APPROVED | 17d7290 |
+| 3 | Filter foldhash + per-connection FilterNames | IN_PROGRESS | 1 | - | - |
 | 4 | Characterization tests (regression net, test-only) | PENDING | 0 | - | - |
 | 5 | Pure extraction refactor: block_reconstruction.rs | PENDING | 0 | - | - |
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
