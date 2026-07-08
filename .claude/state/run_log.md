@@ -168,7 +168,7 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 3 | Filter foldhash + per-connection FilterNames | DONE | 2 | APPROVED | 4700fbd |
 | 4 | Characterization tests (regression net, test-only) | DONE | 1 | APPROVED | pending |
 | 5 | Pure extraction refactor: block_reconstruction.rs | DONE | 3 | APPROVED | pending |
-| 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
+| 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | IN_PROGRESS | 1 | - | - |
 | 6b | The decoupling: geyser_dispatch broadcasts raw Processed directly (the latency win) | PENDING | 0 | - | - |
 | 6c | Shutdown/join wiring | PENDING | 0 | - | - |
 
