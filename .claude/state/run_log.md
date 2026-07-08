@@ -165,8 +165,8 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 |---|------|--------|----------|---------------|--------|
 | 1 | Remove ParallelEncoder, direct synchronous encode_messages() | DONE | 2 | APPROVED | 7b7867b |
 | 2 | jemalloc as global allocator | DONE | 1 | APPROVED | 17d7290 |
-| 3 | Filter foldhash + per-connection FilterNames | DONE | 2 | APPROVED | pending |
-| 4 | Characterization tests (regression net, test-only) | PENDING | 0 | - | - |
+| 3 | Filter foldhash + per-connection FilterNames | DONE | 2 | APPROVED | 4700fbd |
+| 4 | Characterization tests (regression net, test-only) | IN_PROGRESS | 1 | - | - |
 | 5 | Pure extraction refactor: block_reconstruction.rs | PENDING | 0 | - | - |
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
 | 6b | The decoupling: geyser_dispatch broadcasts raw Processed directly (the latency win) | PENDING | 0 | - | - |
