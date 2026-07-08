@@ -170,7 +170,7 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 5 | Pure extraction refactor: block_reconstruction.rs | DONE | 3 | APPROVED | pending |
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | DONE | 1 | APPROVED | pending |
 | 6b | The decoupling: geyser_dispatch broadcasts raw Processed directly (the latency win) | DONE | 1 | APPROVED | pending |
-| 6c | Shutdown/join wiring | PENDING | 0 | - | - |
+| 6c | Shutdown/join wiring | IN_PROGRESS | 1 | - | - |
 
 ## Task Notes
 
