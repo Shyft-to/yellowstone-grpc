@@ -163,7 +163,7 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 ## Task Progress
 | # | Task | Status | Attempts | Last Verdict | Commit |
 |---|------|--------|----------|---------------|--------|
-| 1 | Remove ParallelEncoder, direct synchronous encode_messages() | IN_PROGRESS | 1 | - | - |
+| 1 | Remove ParallelEncoder, direct synchronous encode_messages() | IN_PROGRESS | 1 | REJECTED | - |
 | 2 | jemalloc as global allocator | PENDING | 0 | - | - |
 | 3 | Filter foldhash + per-connection FilterNames | PENDING | 0 | - | - |
 | 4 | Characterization tests (regression net, test-only) | PENDING | 0 | - | - |
@@ -171,6 +171,11 @@ Minor non-blocking notes: Task 6a's test may need to substitute a direct call to
 | 6a | Spawn reconstruction thread + channel, move BTreeMap/replay ownership (zero latency win yet) | PENDING | 0 | - | - |
 | 6b | The decoupling: geyser_dispatch broadcasts raw Processed directly (the latency win) | PENDING | 0 | - | - |
 | 6c | Shutdown/join wiring | PENDING | 0 | - | - |
+
+## Task Notes
+
+### Task 1, attempt 1 — REJECTED (validator agent id a22dfc6b5858ffd30)
+All mechanical replacement, config/CHANGELOG changes, test additions, and benchmark methodology/fairness confirmed correct via independent inspection and re-running the benchmark (`cargo bench -p yellowstone-grpc-geyser --features bench --bench encode -- encode_dispatch`). Batch 1/4/16/64 results corroborated (parity, ~10.85x, ~4.0x, ~1.5x faster respectively for sequential). **Blocking finding**: at batch 256, two independent validator re-runs show `rayon_parallel` consistently and reproducibly *faster* than `sequential` (~11-17%, non-overlapping CIs) — the opposite of what the executor's report claimed ("roughly parity/sequential slightly ahead"). This is exactly the case the plan's hard requirement exists to catch. No code change needed — rerun the benchmark, report the correct direction at size 256, and explicitly argue (referencing `processed_messages_max`'s default of 31 in `config.rs`, which bounds realistic production batch sizes well below 256) why this crossover doesn't undermine the "no flag-back needed" conclusion. Minor, non-blocking: `.claude/agents/executor.md`/`.claude/commands/implement.md` show unrelated working-tree modifications (pre-existing dirty state from harness setup, not this task's diff) — confirm/separate before commit; batch-64 ratio claim (1.6-1.8x) was slightly outside validator's measured ~1.51x, likely just noise, worth tightening.
 
 ## Blockers
 <none>
