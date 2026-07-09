@@ -100,3 +100,42 @@ impl FilterNames {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Documents that per-connection `FilterNames` instances (as constructed
+    // once per connection in `Geyser::subscribe`) are fully independent: each
+    // enforces its own `name_size_limit` and has no visibility into names
+    // registered by another instance.
+    #[test]
+    fn test_independent_filter_names_enforce_own_limits() {
+        let mut small_limit = FilterNames::new(5, 1024, Duration::from_secs(1));
+        let mut large_limit = FilterNames::new(100, 1024, Duration::from_secs(1));
+
+        let long_name = "a".repeat(50);
+
+        assert!(matches!(
+            small_limit.get(&long_name),
+            Err(FilterNameError::Oversized { limit: 5, size: 50 })
+        ));
+        assert!(large_limit.get(&long_name).is_ok());
+    }
+
+    // Documents the accepted trade-off from de-sharing `FilterNames`: two
+    // connections subscribing with the same filter name each get their own
+    // `FilterName` (backed by a distinct `Arc<String>`), instead of sharing
+    // one interned instance as they would have with a shared `FilterNames`.
+    #[test]
+    fn test_filter_names_no_longer_intern_across_instances() {
+        let mut connection_a = FilterNames::new(64, 1024, Duration::from_secs(1));
+        let mut connection_b = FilterNames::new(64, 1024, Duration::from_secs(1));
+
+        let name_a = connection_a.get("shared").unwrap();
+        let name_b = connection_b.get("shared").unwrap();
+
+        assert_eq!(name_a.as_ref(), name_b.as_ref());
+        assert!(!Arc::ptr_eq(&name_a.0, &name_b.0));
+    }
+}

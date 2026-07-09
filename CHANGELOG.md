@@ -10,6 +10,9 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ## [Unreleased]
 
+### Breaking
+- geyser: remove the rayon-backed `ParallelEncoder` in favor of direct synchronous encoding on the dispatch hot path; the `grpc.encoder_threads` config field no longer exists and, since `ConfigGrpc` denies unknown fields, configs that still set it will fail to load
+
 ## 2026-05-13
 
 - yellowstone-grpc-geyser-13.1.0

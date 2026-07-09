@@ -1,9 +1,8 @@
 use {
     crate::{
         config::Config,
-        grpc::GrpcService,
+        grpc::{DispatchThreadHandles, GrpcService},
         metrics::{self, incr_geyser_event_dropped, PrometheusService},
-        parallel::ParallelEncoder,
         plugin::{
             filter::limits::FilterLimits,
             message::{
@@ -42,7 +41,7 @@ pub struct PluginInner {
     grpc_channel: mpsc::UnboundedSender<Message>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
-    encoder_handle: std::thread::JoinHandle<()>,
+    dispatch_threads: Option<DispatchThreadHandles>,
 }
 
 impl PluginInner {
@@ -115,9 +114,6 @@ impl GeyserPlugin for Plugin {
             .build()
             .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
 
-        let encoder_threads = config.grpc.encoder_threads;
-        let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads);
-
         let result = runtime.block_on(async move {
             let (debug_client_tx, debug_client_rx) = mpsc::unbounded_channel();
             // Create prometheus service First so if it fails the plugin doesn't spawn geyser tasks unnecessarily.
@@ -130,26 +126,23 @@ impl GeyserPlugin for Plugin {
             .await
             .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
 
-            let (snapshot_channel, grpc_channel) = GrpcService::create(
+            let (snapshot_channel, grpc_channel, dispatch_threads) = GrpcService::create(
                 config.grpc,
                 config.debug_clients_http.then_some(debug_client_tx),
                 is_reload,
                 grpc_cancellation_token,
                 grpc_task_tracker,
-                encoder,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
-            Ok::<_, GeyserPluginError>((snapshot_channel, grpc_channel))
+            Ok::<_, GeyserPluginError>((snapshot_channel, grpc_channel, dispatch_threads))
         });
 
-        let (snapshot_channel, grpc_channel) = match result {
+        let (snapshot_channel, grpc_channel, dispatch_threads) = match result {
             Ok(val) => val,
             Err(e) => {
                 log::error!("failed to start plugin services: {e}");
                 plugin_cancellation_token.cancel();
-                // join before returning because encoder already dropped, channel closed
-                let _ = encoder_handle.join();
                 return Err(GeyserPluginError::Custom(format!("{e:?}").into()));
             }
         };
@@ -162,7 +155,7 @@ impl GeyserPlugin for Plugin {
             grpc_channel,
             plugin_cancellation_token,
             plugin_task_tracker,
-            encoder_handle,
+            dispatch_threads,
         });
 
         Ok(())
@@ -183,8 +176,19 @@ impl GeyserPlugin for Plugin {
             );
             inner.runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
             log::info!("tokio runtime shut down in {:?}", now.elapsed());
-            if let Err(e) = inner.encoder_handle.join() {
-                log::error!("encoder thread panicked: {:?}", e);
+            if let Some(dispatch_threads) = inner.dispatch_threads {
+                // `grpc_channel` was dropped above, which closes
+                // geyser_dispatch's inbound channel: it exits its loop and
+                // drops its own sender into the block-reconstruction
+                // channel, which in turn causes block_reconstruction_dispatch
+                // to observe closure and exit. Both threads should already
+                // be finished or finishing by the time we get here.
+                if let Err(e) = dispatch_threads.geyser_dispatch.join() {
+                    log::error!("geyser-dispatch thread panicked: {:?}", e);
+                }
+                if let Err(e) = dispatch_threads.block_reconstruction.join() {
+                    log::error!("block-reconstruction thread panicked: {:?}", e);
+                }
             }
             log::info!("plugin shutdown complete");
         }
