@@ -345,6 +345,12 @@ pub struct ConfigGrpc {
     /// If None, geyser_loop runs as a normal async tokio task with the 10ms batch timer.
     #[serde(default)]
     pub geyser_dispatch_cpu_core: Option<usize>,
+    /// CPU core to pin the block-reconstruction thread to. Only takes effect when
+    /// `geyser_dispatch_cpu_core` is also set (the block-reconstruction thread only
+    /// exists in that configuration). If None, the thread runs unpinned, wherever the
+    /// OS scheduler places it.
+    #[serde(default)]
+    pub block_reconstruction_cpu_core: Option<usize>,
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]

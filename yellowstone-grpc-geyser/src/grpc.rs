@@ -704,6 +704,7 @@ impl GrpcService {
         let dispatch_threads = if let Some(cpu_core) = config.geyser_dispatch_cpu_core {
             Some(Self::spawn_dispatch_threads(
                 cpu_core,
+                config.block_reconstruction_cpu_core,
                 messages_rx,
                 blocks_meta_tx,
                 broadcast_tx,
@@ -774,14 +775,18 @@ impl GrpcService {
         Ok((snapshot_tx, messages_tx, dispatch_threads))
     }
 
-    /// Spawns the CPU-pinned `geyser-dispatch`/`block-reconstruction`
-    /// thread pair exactly as `GrpcService::create` wires them for
+    /// Spawns the `geyser-dispatch`/`block-reconstruction` thread pair
+    /// exactly as `GrpcService::create` wires them for
     /// `geyser_dispatch_cpu_core`-configured deployments, returning their
-    /// `JoinHandle`s. Extracted into its own function so `create()` and its
-    /// shutdown-wiring tests exercise the identical spawn code.
+    /// `JoinHandle`s. `geyser-dispatch` is always pinned to `cpu_core`;
+    /// `block-reconstruction` is pinned to `block_reconstruction_cpu_core`
+    /// if set, otherwise left unpinned (scheduled wherever the OS puts it).
+    /// Extracted into its own function so `create()` and its shutdown-wiring
+    /// tests exercise the identical spawn code.
     #[allow(clippy::too_many_arguments)]
     fn spawn_dispatch_threads(
         cpu_core: usize,
+        block_reconstruction_cpu_core: Option<usize>,
         messages_rx: mpsc::UnboundedReceiver<Message>,
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
         broadcast_tx: broadcast::Sender<BroadcastedMessage>,
@@ -805,6 +810,15 @@ impl GrpcService {
         let block_reconstruction = std::thread::Builder::new()
             .name("block-reconstruction".into())
             .spawn(move || {
+                if let Some(block_reconstruction_cpu_core) = block_reconstruction_cpu_core {
+                    if let Err(e) = crate::util::cpu_core_affinity::set_thread_affinity(&[
+                        block_reconstruction_cpu_core,
+                    ]) {
+                        log::warn!(
+                            "block-reconstruction: failed to pin to CPU {block_reconstruction_cpu_core}: {e}"
+                        );
+                    }
+                }
                 Self::block_reconstruction_dispatch(
                     reconstruction_rx,
                     broadcast_tx,
@@ -3120,6 +3134,7 @@ mod tests {
 
             let handles = GrpcService::spawn_dispatch_threads(
                 0,
+                None,
                 messages_rx,
                 None,
                 broadcast_tx,
@@ -3158,6 +3173,60 @@ mod tests {
             .expect(
                 "geyser-dispatch/block-reconstruction threads did not join within the \
                  bounded timeout after shutdown",
+            )
+            .expect("join task panicked");
+        }
+
+        // --- 11. block_reconstruction_cpu_core: pinning the reconstruction
+        //         thread doesn't break correctness or shutdown -----------
+        //
+        // CPU pinning itself can't be observed portably in a unit test (core
+        // availability/count varies by host), so this only proves the
+        // config plumbing works end-to-end and doesn't regress the shutdown
+        // behavior verified above — not that the pin call actually lands.
+        // `set_thread_affinity` failures are logged and non-fatal by design
+        // (see `geyser-dispatch`'s identical handling), so an invalid core
+        // on a given host degrades to "unpinned", it never panics.
+
+        #[tokio::test]
+        async fn test_spawn_dispatch_threads_with_block_reconstruction_cpu_core_pinned() {
+            let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+            let (broadcast_tx, _rx) = broadcast::channel::<BroadcastedMessage>(16);
+
+            let handles = GrpcService::spawn_dispatch_threads(
+                0,
+                Some(0),
+                messages_rx,
+                None,
+                broadcast_tx,
+                None,
+                None,
+                100,
+                1,
+            );
+
+            messages_tx
+                .send(make_slot(1, None, SlotStatus::Processed))
+                .unwrap();
+            drop(messages_tx);
+
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || {
+                    handles
+                        .geyser_dispatch
+                        .join()
+                        .expect("geyser-dispatch thread panicked");
+                    handles
+                        .block_reconstruction
+                        .join()
+                        .expect("block-reconstruction thread panicked");
+                }),
+            )
+            .await
+            .expect(
+                "geyser-dispatch/block-reconstruction threads did not join within the \
+                 bounded timeout after shutdown, with block_reconstruction_cpu_core set",
             )
             .expect("join task panicked");
         }
