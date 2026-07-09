@@ -51,6 +51,7 @@ tower-layer = { workspace = true }
 tonic = { workspace = true, features = ["gzip", "zstd", "tls-native-roots"] }
 tonic-health = { workspace = true }
 tonic-prost = { workspace = true }
+wincode = { workspace = true }
 
 # Agave Monorepo
 agave-geyser-plugin-interface = { workspace = true }
@@ -64,9 +65,9 @@ solana-hash = { workspace = true }
 solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
-solana-transaction = { workspace = true }
+solana-transaction = { workspace = true, features = ["wincode"] }
 solana-transaction-context = { workspace = true }
-solana-transaction-error = { workspace = true }
+solana-transaction-error = { workspace = true, features = ["wincode"] }
 solana-transaction-status = { workspace = true }
 
 # Solana Misc
@@ -110,7 +111,7 @@ solana-keypair = { workspace = true }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }
 solana-storage-proto = { workspace = true }
-solana-transaction = { workspace = true, features = ["bincode", "blake3"] }
+solana-transaction = { workspace = true, features = ["wincode", "blake3"] }
 
 [lints]
 workspace = true
