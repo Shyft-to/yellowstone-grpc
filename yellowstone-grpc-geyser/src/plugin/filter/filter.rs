@@ -1395,6 +1395,7 @@ mod tests {
                 account_include: vec![],
                 account_exclude: vec![],
                 account_required: vec![],
+                token_accounts: None,
             },
         );
 
@@ -1430,6 +1431,7 @@ mod tests {
                 account_include: vec![],
                 account_exclude: vec![],
                 account_required: vec![],
+                token_accounts: None,
             },
         );
 
@@ -1471,6 +1473,7 @@ mod tests {
                 account_include,
                 account_exclude: vec![],
                 account_required: vec![],
+                token_accounts: None,
             },
         );
 
@@ -1536,6 +1539,7 @@ mod tests {
                 account_include,
                 account_exclude: vec![],
                 account_required: vec![],
+                token_accounts: None,
             },
         );
 
@@ -1601,6 +1605,7 @@ mod tests {
                 account_include: vec![],
                 account_exclude,
                 account_required: vec![],
+                token_accounts: None,
             },
         );
 
@@ -1652,6 +1657,7 @@ mod tests {
                 account_include,
                 account_exclude: vec![],
                 account_required,
+                token_accounts: None,
             },
         );
 
@@ -1725,6 +1731,7 @@ mod tests {
                 account_include,
                 account_exclude: vec![],
                 account_required,
+                token_accounts: None,
             },
         );
 
