@@ -862,6 +862,9 @@ impl GrpcService {
             );
         }
 
+        // Extract the (Copy) dispatch-core setting before `config` is captured below.
+        let geyser_dispatch_cpu_core = config.geyser_dispatch_cpu_core;
+
         {
             let broadcast_tx = broadcast_tx.clone();
             task_tracker.spawn(async move {
@@ -877,9 +880,31 @@ impl GrpcService {
             });
         }
 
-        task_tracker.spawn(async move {
-            Self::geyser_loop(messages_rx, broadcast_tx, block_reconstruction_tx).await;
-        });
+        // The geyser dispatch loop (fast fan-out path). When a CPU core is configured, run it
+        // on a dedicated pinned std::thread as a busy spin loop; otherwise keep it as an
+        // ordinary tokio task. Both share the same body (`geyser_dispatch`/`geyser_loop`).
+        match geyser_dispatch_cpu_core {
+            Some(core) => {
+                std::thread::Builder::new()
+                    .name("geyser-dispatch".into())
+                    .spawn(move || {
+                        if let Err(e) =
+                            crate::util::cpu_core_affinity::set_thread_affinity(&[core])
+                        {
+                            log::warn!("geyser-dispatch: failed to pin to CPU {core}: {e}");
+                        } else {
+                            log::info!("geyser-dispatch: pinned to CPU {core}");
+                        }
+                        Self::geyser_dispatch(messages_rx, broadcast_tx, block_reconstruction_tx);
+                    })
+                    .expect("failed to spawn geyser-dispatch thread");
+            }
+            None => {
+                task_tracker.spawn(async move {
+                    Self::geyser_loop(messages_rx, broadcast_tx, block_reconstruction_tx).await;
+                });
+            }
+        }
 
         // Health check service
         let (health_reporter, health_service) = health_reporter();
@@ -1121,6 +1146,131 @@ impl GrpcService {
                 }
             }
         }
+    }
+
+    /// CPU-pinned, busy-spin variant of [`Self::geyser_loop`] for use on a dedicated
+    /// `std::thread`. Behaviourally identical to `geyser_loop` — same batching, same
+    /// split into processed vs. block-reconstruction messages, same broadcast ordering —
+    /// but driven by `try_recv()` + `spin_loop()` instead of an async `recv().await`.
+    ///
+    /// This removes two latency sources present in the async task: tokio scheduler wake
+    /// jitter (the dispatch loop no longer competes with per-client tasks for the runtime)
+    /// and any await-point rescheduling. The body has no `.await`, which is exactly why it
+    /// can run off-runtime; `broadcast::Sender::send` and `UnboundedSender::send` do not
+    /// require a tokio reactor.
+    ///
+    /// The loop exits when the message channel is disconnected (i.e. the plugin dropped the
+    /// sender during shutdown). It does not observe the cancellation token.
+    ///
+    /// WARNING: this pins one core at 100% even when idle. The core MUST be disjoint from
+    /// the tokio worker affinity set and ideally isolated (`isolcpus`/`nohz_full`).
+    fn geyser_dispatch(
+        mut messages_rx: mpsc::UnboundedReceiver<Message>,
+        broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        block_reconstruction_tx: mpsc::UnboundedSender<Arc<Vec<Message>>>,
+    ) {
+        const PROCESSED_MESSAGES_MAX: usize = 31;
+        const STATE_MESSAGES_MAX: usize = 4;
+
+        let mut processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+        let mut confirmed_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+        let mut finalized_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+        let mut block_reconstruction_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+
+        let is_block_reconstruction_message = |message: &Message| match message {
+            Message::BlockMeta(_) => true,
+            Message::Slot(slot_message) => matches!(
+                slot_message.status,
+                SlotStatus::Processed | SlotStatus::Confirmed | SlotStatus::Finalized
+            ),
+            _ => false,
+        };
+
+        loop {
+            match messages_rx.try_recv() {
+                Ok(message) => {
+                    metrics::message_queue_size_dec();
+
+                    if is_block_reconstruction_message(&message) {
+                        block_reconstruction_messages.push(message);
+                    } else {
+                        processed_messages.push(message);
+                    }
+
+                    while let Ok(message) = messages_rx.try_recv() {
+                        metrics::message_queue_size_dec();
+
+                        if is_block_reconstruction_message(&message) {
+                            block_reconstruction_messages.push(message);
+                        } else {
+                            processed_messages.push(message);
+                            if processed_messages.len() >= PROCESSED_MESSAGES_MAX {
+                                break;
+                            }
+                        }
+                    }
+
+                    for message in processed_messages.iter() {
+                        match message {
+                            Message::Slot(slot_message) => {
+                                // Only match on slot lifecycle update not commitment update, as
+                                // we must go through the block machine to make sure users sees block content before any commitment update.
+                                if matches!(slot_message.status,
+                                    SlotStatus::FirstShredReceived |
+                                    SlotStatus::Completed |
+                                    SlotStatus::CreatedBank |
+                                    SlotStatus::Dead
+                                ) {
+                                    confirmed_messages.push(Message::Slot(slot_message.clone()));
+                                    finalized_messages.push(Message::Slot(slot_message.clone()));
+                                }
+                            }
+                            Message::Block(_) => {
+                               unreachable!("Block message should not be sent by plugin directly, it is constructed in geyser loop after receiving all necessary messages for the slot and then broadcasted to subscribers");
+                            }
+                            _ => {
+                                /* We don't need to process anything here.  */
+                            }
+                        }
+                    }
+
+                    encode_messages(&processed_messages);
+                    GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+
+                    let processed_messages_arc = Arc::new(processed_messages);
+                    let _ = broadcast_tx.send((CommitmentLevel::Processed, Arc::clone(&processed_messages_arc)));
+                    processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+
+                    if !confirmed_messages.is_empty() {
+                        let _ = broadcast_tx.send((CommitmentLevel::Confirmed, Arc::new(confirmed_messages)));
+                        confirmed_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+                    }
+
+                    if !finalized_messages.is_empty() {
+                        let _ = broadcast_tx.send((CommitmentLevel::Finalized, Arc::new(finalized_messages)));
+                        finalized_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+                    }
+
+                    let _ = block_reconstruction_tx.send(processed_messages_arc);
+
+                    // Make sure that blockmeta is always after all kind of other events so the block-machine sees every block
+                    // updates.
+                    if !block_reconstruction_messages.is_empty() {
+                        let _ = block_reconstruction_tx.send(Arc::new(block_reconstruction_messages));
+                        block_reconstruction_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    std::hint::spin_loop();
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    info!("Geyser dispatch: messages channel closed");
+                    break;
+                }
+            }
+        }
+
+        info!("Geyser dispatch thread exiting");
     }
 
     async fn block_reconstruction_loop(

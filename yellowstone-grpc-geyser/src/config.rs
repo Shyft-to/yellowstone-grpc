@@ -389,6 +389,19 @@ pub struct ConfigGrpc {
 
     #[serde(default)]
     pub listen: Option<Vec<ListenConfig>>,
+
+    ///
+    /// When set, the geyser message dispatch loop runs on a dedicated `std::thread`
+    /// pinned to this CPU core, using a busy `try_recv()` spin loop instead of an
+    /// async tokio task. This removes tokio scheduler wake jitter and any batch-timer
+    /// latency from the hot fan-out path.
+    ///
+    /// The pinned core MUST be disjoint from `tokio.affinity` and ideally isolated
+    /// (`isolcpus`/`nohz_full`), because the spin loop keeps the core at 100% even when
+    /// idle. When unset, the dispatch loop runs as an ordinary tokio task (default).
+    ///
+    #[serde(default)]
+    pub geyser_dispatch_cpu_core: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
