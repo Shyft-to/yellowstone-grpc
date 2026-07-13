@@ -11,9 +11,9 @@ use {
             self, incr_grpc_method_call_count, observe_subscriber_queue_size,
             subscription_limit_exceeded_inc, GEYSER_BATCH_SIZE,
         },
+        parallel::ParallelEncoder,
         plugin::{
             filter::{
-                encoder::encode_messages,
                 limits::FilterLimits,
                 message::{FilteredUpdate, FilteredUpdateDeshred, FilteredUpdateOneof},
                 name::FilterNames,
@@ -877,8 +877,15 @@ impl GrpcService {
             });
         }
 
+        let parallel_encoder = ParallelEncoder::new(config.encoder_threads);
         task_tracker.spawn(async move {
-            Self::geyser_loop(messages_rx, broadcast_tx, block_reconstruction_tx).await;
+            Self::geyser_loop(
+                messages_rx,
+                broadcast_tx,
+                block_reconstruction_tx,
+                parallel_encoder,
+            )
+            .await;
         });
 
         // Health check service
@@ -1020,6 +1027,7 @@ impl GrpcService {
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
         broadcast_tx: broadcast::Sender<BroadcastedMessage>,
         block_reconstruction_tx: mpsc::UnboundedSender<Arc<Vec<Message>>>,
+        parallel_encoder: ParallelEncoder,
     ) {
         const PROCESSED_MESSAGES_MAX: usize = 31;
         const STATE_MESSAGES_MAX: usize = 4; /* In a reasonable loop, we don't expect to receive more than FirstShredReceived, Completed, CreatedBank, or Finalized messages per iteration */
@@ -1093,7 +1101,15 @@ impl GrpcService {
                         }
                     }
 
-                    encode_messages(&processed_messages);
+                    // Batch size drives parallel-encoder tuning. Logged at info so it
+                    // shows up in the validator log without any RUST_LOG changes; grep
+                    // the `encode_batch_size=` token (see scripts/encode_batch_size.sh).
+                    info!(
+                        target: "encode_batch_size",
+                        "encode_batch_size={}",
+                        processed_messages.len()
+                    );
+                    parallel_encoder.encode_blocking(&processed_messages);
                     GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
 
                     let processed_messages_arc = Arc::new(processed_messages);
@@ -2430,6 +2446,7 @@ mod tests {
                     messages_rx,
                     broadcast_tx,
                     block_reconstruction_tx,
+                    ParallelEncoder::new(2),
                 ))
             };
             let handle_reconstruction = tokio::spawn(GrpcService::block_reconstruction_loop(

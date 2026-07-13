@@ -5,6 +5,7 @@ pub mod config;
 pub mod grpc;
 pub mod metered;
 pub mod metrics;
+pub mod parallel;
 pub mod plugin;
 pub(crate) mod ratelimit;
 pub(crate) mod util;

@@ -134,20 +134,29 @@ impl AccountEncoder {
     }
 }
 
+/// Pre-encode a single message's proto body into its `pre_encoded` slot.
+///
+/// Only `Transaction` and `Account` carry a `pre_encoded` cache; all other
+/// message types are no-ops. Writing goes through `OnceLock::set`, so this is
+/// safe to call concurrently on distinct messages (see [`crate::parallel`]).
+pub fn encode_message(msg: &Message) {
+    match msg {
+        Message::Transaction(tx) => {
+            if tx.transaction.pre_encoded.get().is_none() {
+                TransactionEncoder::pre_encode(&tx.transaction);
+            }
+        }
+        Message::Account(acc) => {
+            if acc.account.pre_encoded.get().is_none() {
+                AccountEncoder::pre_encode(&acc.account);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn encode_messages(messages: &Vec<Message>) {
     for msg in messages {
-        match msg {
-            Message::Transaction(tx) => {
-                if tx.transaction.pre_encoded.get().is_none() {
-                    TransactionEncoder::pre_encode(&tx.transaction);
-                }
-            }
-            Message::Account(acc) => {
-                if acc.account.pre_encoded.get().is_none() {
-                    AccountEncoder::pre_encode(&acc.account);
-                }
-            }
-            _ => {}
-        }
+        encode_message(msg);
     }
 }

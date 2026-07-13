@@ -350,6 +350,13 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub replay_stored_slots: u64,
+    /// Number of threads in the parallel message-encoder pool. `0` lets rayon
+    /// pick a default from available parallelism.
+    #[serde(
+        default = "ConfigGrpc::encoder_threads_default",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub encoder_threads: usize,
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]
@@ -571,6 +578,10 @@ impl ConfigGrpc {
 
     const fn default_replay_stored_slots() -> u64 {
         150
+    }
+
+    const fn encoder_threads_default() -> usize {
+        4
     }
 }
 
