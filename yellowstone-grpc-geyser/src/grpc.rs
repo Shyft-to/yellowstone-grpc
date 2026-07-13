@@ -868,10 +868,11 @@ impl GrpcService {
         let replay_stored_slots = config.replay_stored_slots;
 
         // The block reconstruction loop (Confirmed/Finalized assembly). When a CPU core is
-        // configured, run it on a dedicated pinned std::thread driving the existing async loop
-        // via its own single-thread runtime — this moves the heavy assembly work off the shared
-        // runtime (so it stops competing with per-client fan-out) without busy-spinning. When
-        // unset, it runs as an ordinary tokio task.
+        // configured, run it on a dedicated pinned std::thread as a busy spin loop
+        // (`block_reconstruction_dispatch`) — this moves the heavy assembly work off the shared
+        // runtime so it stops competing with per-client fan-out. When unset, it runs as an
+        // ordinary tokio task (`block_reconstruction_loop`). Both share the same processing
+        // helpers.
         {
             let broadcast_tx = broadcast_tx.clone();
             match block_reconstruction_cpu_core {
@@ -888,18 +889,14 @@ impl GrpcService {
                             } else {
                                 log::info!("block-reconstruction: pinned to CPU {core}");
                             }
-                            let runtime = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .expect("failed to build block-reconstruction runtime");
-                            runtime.block_on(Self::block_reconstruction_loop(
+                            Self::block_reconstruction_dispatch(
                                 block_reconstruction_rx,
                                 blocks_meta_tx,
                                 broadcast_tx,
                                 replay_stored_slots_rx,
                                 replay_first_available_slot,
                                 replay_stored_slots,
-                            ));
+                            );
                         })
                         .expect("failed to spawn block-reconstruction thread");
                 }
@@ -1324,11 +1321,6 @@ impl GrpcService {
         let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(rx);
 
         let mut block_machine = BlockMachineStorage::new(replay_stored_slots as usize);
-        const ALL_COMMITMENT_LEVELS: [CommitmentLevel; 3] = [
-            CommitmentLevel::Processed,
-            CommitmentLevel::Confirmed,
-            CommitmentLevel::Finalized,
-        ];
 
         const BUFFERED_MESSAGES_CAPACITY: usize = 32;
         let mut buffered_messages = Vec::with_capacity(BUFFERED_MESSAGES_CAPACITY);
@@ -1351,102 +1343,17 @@ impl GrpcService {
                     }
 
                     for messages in buffered_messages.drain(..) {
-                        for message in messages.iter() {
-                            if let Message::Slot(slot_message) = message {
-                                metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
-                            }
-
-                            if let Some(blocks_meta_tx) = &blocks_meta_tx {
-                                if matches!(&message, Message::Slot(_) | Message::BlockMeta(_)) {
-                                    let _ = blocks_meta_tx.send(message.clone());
-                                }
-                            }
-
-                            block_machine.add(message.clone());
-
-                            while let Some((slot_update, frozen_block)) = block_machine.pop_ready_block() {
-                                let commitment_level = match slot_update.commitment {
-                                    solana_commitment_config::CommitmentLevel::Processed => CommitmentLevel::Processed,
-                                    solana_commitment_config::CommitmentLevel::Confirmed => CommitmentLevel::Confirmed,
-                                    solana_commitment_config::CommitmentLevel::Finalized => CommitmentLevel::Finalized,
-                                };
-                                // Processed must be sent differently, since processed geyser event were individually sent,
-                                // we only need to send Message::Block for block subscriber downstream.
-                                // While, confirmed,finalized must be sent in the two flavors: as a stream of individual events and block.
-                                if commitment_level != CommitmentLevel::Processed {
-                                    let _ = broadcast_tx.send((commitment_level, frozen_block.messages()));
-                                }
-
-                                let block_meta = Message::BlockMeta(frozen_block.get_block_meta());
-                                let msg_block = Message::Block(Arc::new(frozen_block.get_message_block()));
-                                let _ = broadcast_tx.send((commitment_level, Arc::new(vec![msg_block, block_meta])));
-
-                                let slot_message = Message::Slot(MessageSlot {
-                                    slot: slot_update.slot,
-                                    parent: slot_update.parent_slot,
-                                    status: match slot_update.commitment {
-                                        solana_commitment_config::CommitmentLevel::Processed => SlotStatus::Processed,
-                                        solana_commitment_config::CommitmentLevel::Confirmed => SlotStatus::Confirmed,
-                                        solana_commitment_config::CommitmentLevel::Finalized => SlotStatus::Finalized,
-                                    },
-                                    dead_error: None,
-                                    created_at: Timestamp::from(SystemTime::now())
-                                });
-                                let slot_message_singleton_vec = Arc::new(vec![slot_message.clone()]);
-                                for commitment_level in ALL_COMMITMENT_LEVELS {
-                                    let _ = broadcast_tx.send((commitment_level, Arc::clone(&slot_message_singleton_vec)));
-                                }
-                            }
-
-                            let min_replayable_slot = block_machine.min_replayable_slot();
-                            if let (Some(min_slot), Some(replay_first_available_slot)) = (min_replayable_slot, replay_first_available_slot.as_ref()) {
-                                replay_first_available_slot.store(min_slot, Ordering::Relaxed);
-                            }
-                        }
+                        Self::process_reconstruction_messages(
+                            &mut block_machine,
+                            &blocks_meta_tx,
+                            &broadcast_tx,
+                            &replay_first_available_slot,
+                            &messages,
+                        );
                     }
                 },
                 Some((commitment, replay_slot, tx)) = replay_stored_slots_rx.recv() => {
-
-                    if let Some(slot) = block_machine.min_replayable_slot() {
-                        if replay_slot < slot {
-                            let _ = tx.send(ReplayedResponse::Lagged(slot));
-                            continue;
-                        }
-                    }
-                    let min_solana_commitment = match commitment {
-                        CommitmentLevel::Processed => solana_commitment_config::CommitmentLevel::Processed,
-                        CommitmentLevel::Confirmed => solana_commitment_config::CommitmentLevel::Confirmed,
-                        CommitmentLevel::Finalized => solana_commitment_config::CommitmentLevel::Finalized,
-                    };
-
-                    let mut replayed_messages = Vec::with_capacity(32_768);
-                    let replayed_slot_iter = block_machine.replay_from_slot(replay_slot, min_solana_commitment);
-
-                    for replayed_slot in replayed_slot_iter {
-                        let slot_messages = replayed_slot
-                            .slot_status_messages
-                            .iter()
-                            .map(|s| {
-                                Message::Slot(MessageSlot {
-                                    slot: s.slot,
-                                    parent: s.parent_slot,
-                                    status: match s.commitment {
-                                        solana_commitment_config::CommitmentLevel::Processed => SlotStatus::Processed,
-                                        solana_commitment_config::CommitmentLevel::Confirmed => SlotStatus::Confirmed,
-                                        solana_commitment_config::CommitmentLevel::Finalized => SlotStatus::Finalized,
-                                    },
-                                    dead_error: None,
-                                    created_at: Timestamp::from(SystemTime::now())
-                                })
-                            });
-                        // 1st Put data (account/txn/entries)
-                        replayed_messages.extend(replayed_slot.frozen_block.messages().iter().cloned());
-                        // 2nd Put block summary
-                        replayed_messages.push(Message::BlockMeta(replayed_slot.frozen_block.get_block_meta()));
-                        // 3rd Put slot status
-                        replayed_messages.extend(slot_messages);
-                    }
-                    let _ = tx.send(ReplayedResponse::Messages(replayed_messages));
+                    Self::handle_replay_request(&block_machine, commitment, replay_slot, tx);
                 }
                 else => {
                     // No new messages and replay request channel closed, can only happen on shutdown
@@ -1455,6 +1362,204 @@ impl GrpcService {
                 }
             }
         }
+    }
+
+    /// Busy-spin, CPU-pinned variant of [`Self::block_reconstruction_loop`] for use on a
+    /// dedicated `std::thread`. Behaviourally identical — same batching, same block assembly,
+    /// same replay handling (all shared via [`Self::process_reconstruction_messages`] and
+    /// [`Self::handle_replay_request`]) — but driven by `try_recv()` on both the message and
+    /// replay channels with a `spin_loop()` hint when neither had work, instead of an async
+    /// `select!`.
+    ///
+    /// Exits when the message channel disconnects (plugin shutdown). A closed replay channel
+    /// alone does not stop the loop, matching the async variant where inbound messages keep it
+    /// alive.
+    ///
+    /// WARNING: this pins one core at 100% even when idle. The core MUST be disjoint from the
+    /// tokio worker affinity set and ideally isolated (`isolcpus`/`nohz_full`).
+    fn block_reconstruction_dispatch(
+        mut messages_rx: mpsc::UnboundedReceiver<Arc<Vec<Message>>>,
+        blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
+        broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
+        replay_first_available_slot: Option<Arc<AtomicU64>>,
+        replay_stored_slots: u64,
+    ) {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(rx);
+
+        let mut block_machine = BlockMachineStorage::new(replay_stored_slots as usize);
+
+        const BUFFERED_MESSAGES_CAPACITY: usize = 32;
+        let mut buffered_messages = Vec::with_capacity(BUFFERED_MESSAGES_CAPACITY);
+
+        loop {
+            let mut did_work = false;
+
+            match messages_rx.try_recv() {
+                Ok(messages) => {
+                    did_work = true;
+                    buffered_messages.push(messages);
+
+                    while let Ok(messages) = messages_rx.try_recv() {
+                        buffered_messages.push(messages);
+                        if buffered_messages.len() >= BUFFERED_MESSAGES_CAPACITY {
+                            break;
+                        }
+                    }
+
+                    for messages in buffered_messages.drain(..) {
+                        Self::process_reconstruction_messages(
+                            &mut block_machine,
+                            &blocks_meta_tx,
+                            &broadcast_tx,
+                            &replay_first_available_slot,
+                            &messages,
+                        );
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    info!("Block reconstruction dispatch: messages channel closed");
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+
+            // Service at most one replay request per iteration. Empty or Disconnected are both
+            // ignored: a closed replay channel must not stop the reconstruction loop.
+            if let Ok((commitment, replay_slot, tx)) = replay_stored_slots_rx.try_recv() {
+                did_work = true;
+                Self::handle_replay_request(&block_machine, commitment, replay_slot, tx);
+            }
+
+            if !did_work {
+                std::hint::spin_loop();
+            }
+        }
+
+        info!("Block reconstruction dispatch thread exiting");
+    }
+
+    /// Processes one forwarded batch of geyser messages through the block machine: feeds each
+    /// message to `block_machine`, drains any newly-sealed blocks and broadcasts them at their
+    /// commitment level (with the strict block-content → `Message::Block` → slot-status ordering),
+    /// and updates the replay watermark. Shared by [`Self::block_reconstruction_loop`] and
+    /// [`Self::block_reconstruction_dispatch`] so the two variants can never diverge.
+    fn process_reconstruction_messages(
+        block_machine: &mut BlockMachineStorage,
+        blocks_meta_tx: &Option<mpsc::UnboundedSender<Message>>,
+        broadcast_tx: &broadcast::Sender<BroadcastedMessage>,
+        replay_first_available_slot: &Option<Arc<AtomicU64>>,
+        messages: &Arc<Vec<Message>>,
+    ) {
+        const ALL_COMMITMENT_LEVELS: [CommitmentLevel; 3] = [
+            CommitmentLevel::Processed,
+            CommitmentLevel::Confirmed,
+            CommitmentLevel::Finalized,
+        ];
+
+        for message in messages.iter() {
+            if let Message::Slot(slot_message) = message {
+                metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
+            }
+
+            if let Some(blocks_meta_tx) = blocks_meta_tx {
+                if matches!(&message, Message::Slot(_) | Message::BlockMeta(_)) {
+                    let _ = blocks_meta_tx.send(message.clone());
+                }
+            }
+
+            block_machine.add(message.clone());
+
+            while let Some((slot_update, frozen_block)) = block_machine.pop_ready_block() {
+                let commitment_level = match slot_update.commitment {
+                    solana_commitment_config::CommitmentLevel::Processed => CommitmentLevel::Processed,
+                    solana_commitment_config::CommitmentLevel::Confirmed => CommitmentLevel::Confirmed,
+                    solana_commitment_config::CommitmentLevel::Finalized => CommitmentLevel::Finalized,
+                };
+                // Processed must be sent differently, since processed geyser event were individually sent,
+                // we only need to send Message::Block for block subscriber downstream.
+                // While, confirmed,finalized must be sent in the two flavors: as a stream of individual events and block.
+                if commitment_level != CommitmentLevel::Processed {
+                    let _ = broadcast_tx.send((commitment_level, frozen_block.messages()));
+                }
+
+                let block_meta = Message::BlockMeta(frozen_block.get_block_meta());
+                let msg_block = Message::Block(Arc::new(frozen_block.get_message_block()));
+                let _ = broadcast_tx.send((commitment_level, Arc::new(vec![msg_block, block_meta])));
+
+                let slot_message = Message::Slot(MessageSlot {
+                    slot: slot_update.slot,
+                    parent: slot_update.parent_slot,
+                    status: match slot_update.commitment {
+                        solana_commitment_config::CommitmentLevel::Processed => SlotStatus::Processed,
+                        solana_commitment_config::CommitmentLevel::Confirmed => SlotStatus::Confirmed,
+                        solana_commitment_config::CommitmentLevel::Finalized => SlotStatus::Finalized,
+                    },
+                    dead_error: None,
+                    created_at: Timestamp::from(SystemTime::now())
+                });
+                let slot_message_singleton_vec = Arc::new(vec![slot_message.clone()]);
+                for commitment_level in ALL_COMMITMENT_LEVELS {
+                    let _ = broadcast_tx.send((commitment_level, Arc::clone(&slot_message_singleton_vec)));
+                }
+            }
+
+            let min_replayable_slot = block_machine.min_replayable_slot();
+            if let (Some(min_slot), Some(replay_first_available_slot)) = (min_replayable_slot, replay_first_available_slot.as_ref()) {
+                replay_first_available_slot.store(min_slot, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Services a single `from_slot` replay request against the current block machine state.
+    /// Shared by [`Self::block_reconstruction_loop`] and [`Self::block_reconstruction_dispatch`].
+    fn handle_replay_request(
+        block_machine: &BlockMachineStorage,
+        commitment: CommitmentLevel,
+        replay_slot: Slot,
+        tx: oneshot::Sender<ReplayedResponse>,
+    ) {
+        if let Some(slot) = block_machine.min_replayable_slot() {
+            if replay_slot < slot {
+                let _ = tx.send(ReplayedResponse::Lagged(slot));
+                return;
+            }
+        }
+        let min_solana_commitment = match commitment {
+            CommitmentLevel::Processed => solana_commitment_config::CommitmentLevel::Processed,
+            CommitmentLevel::Confirmed => solana_commitment_config::CommitmentLevel::Confirmed,
+            CommitmentLevel::Finalized => solana_commitment_config::CommitmentLevel::Finalized,
+        };
+
+        let mut replayed_messages = Vec::with_capacity(32_768);
+        let replayed_slot_iter = block_machine.replay_from_slot(replay_slot, min_solana_commitment);
+
+        for replayed_slot in replayed_slot_iter {
+            let slot_messages = replayed_slot
+                .slot_status_messages
+                .iter()
+                .map(|s| {
+                    Message::Slot(MessageSlot {
+                        slot: s.slot,
+                        parent: s.parent_slot,
+                        status: match s.commitment {
+                            solana_commitment_config::CommitmentLevel::Processed => SlotStatus::Processed,
+                            solana_commitment_config::CommitmentLevel::Confirmed => SlotStatus::Confirmed,
+                            solana_commitment_config::CommitmentLevel::Finalized => SlotStatus::Finalized,
+                        },
+                        dead_error: None,
+                        created_at: Timestamp::from(SystemTime::now())
+                    })
+                });
+            // 1st Put data (account/txn/entries)
+            replayed_messages.extend(replayed_slot.frozen_block.messages().iter().cloned());
+            // 2nd Put block summary
+            replayed_messages.push(Message::BlockMeta(replayed_slot.frozen_block.get_block_meta()));
+            // 3rd Put slot status
+            replayed_messages.extend(slot_messages);
+        }
+        let _ = tx.send(ReplayedResponse::Messages(replayed_messages));
     }
 
     #[allow(clippy::too_many_arguments)]
