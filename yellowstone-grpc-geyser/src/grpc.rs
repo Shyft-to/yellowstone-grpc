@@ -862,22 +862,61 @@ impl GrpcService {
             );
         }
 
-        // Extract the (Copy) dispatch-core setting before `config` is captured below.
+        // Extract the (Copy) core settings before `config` is captured below.
         let geyser_dispatch_cpu_core = config.geyser_dispatch_cpu_core;
+        let block_reconstruction_cpu_core = config.block_reconstruction_cpu_core;
+        let replay_stored_slots = config.replay_stored_slots;
 
+        // The block reconstruction loop (Confirmed/Finalized assembly). When a CPU core is
+        // configured, run it on a dedicated pinned std::thread driving the existing async loop
+        // via its own single-thread runtime — this moves the heavy assembly work off the shared
+        // runtime (so it stops competing with per-client fan-out) without busy-spinning. When
+        // unset, it runs as an ordinary tokio task.
         {
             let broadcast_tx = broadcast_tx.clone();
-            task_tracker.spawn(async move {
-                Self::block_reconstruction_loop(
-                    block_reconstruction_rx,
-                    blocks_meta_tx,
-                    broadcast_tx,
-                    replay_stored_slots_rx,
-                    replay_first_available_slot,
-                    config.replay_stored_slots,
-                )
-                .await;
-            });
+            match block_reconstruction_cpu_core {
+                Some(core) => {
+                    std::thread::Builder::new()
+                        .name("block-reconstruction".into())
+                        .spawn(move || {
+                            if let Err(e) =
+                                crate::util::cpu_core_affinity::set_thread_affinity(&[core])
+                            {
+                                log::warn!(
+                                    "block-reconstruction: failed to pin to CPU {core}: {e}"
+                                );
+                            } else {
+                                log::info!("block-reconstruction: pinned to CPU {core}");
+                            }
+                            let runtime = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("failed to build block-reconstruction runtime");
+                            runtime.block_on(Self::block_reconstruction_loop(
+                                block_reconstruction_rx,
+                                blocks_meta_tx,
+                                broadcast_tx,
+                                replay_stored_slots_rx,
+                                replay_first_available_slot,
+                                replay_stored_slots,
+                            ));
+                        })
+                        .expect("failed to spawn block-reconstruction thread");
+                }
+                None => {
+                    task_tracker.spawn(async move {
+                        Self::block_reconstruction_loop(
+                            block_reconstruction_rx,
+                            blocks_meta_tx,
+                            broadcast_tx,
+                            replay_stored_slots_rx,
+                            replay_first_available_slot,
+                            replay_stored_slots,
+                        )
+                        .await;
+                    });
+                }
+            }
         }
 
         // The geyser dispatch loop (fast fan-out path). When a CPU core is configured, run it

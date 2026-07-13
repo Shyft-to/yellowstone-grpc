@@ -402,6 +402,20 @@ pub struct ConfigGrpc {
     ///
     #[serde(default)]
     pub geyser_dispatch_cpu_core: Option<usize>,
+
+    ///
+    /// When set, the block reconstruction loop (Confirmed/Finalized assembly) runs on a
+    /// dedicated `std::thread` pinned to this CPU core, driving the existing async loop via
+    /// its own single-thread tokio runtime. Unlike `geyser_dispatch_cpu_core` this does NOT
+    /// busy-spin — it parks when idle — so its purpose is to move this heavy CPU stage OFF
+    /// the shared runtime so it stops competing with per-client fan-out tasks, rather than
+    /// to shave wake latency (its consumers are consensus-gated and don't need it).
+    ///
+    /// The pinned core should be disjoint from `tokio.affinity`. When unset, the loop runs
+    /// as an ordinary tokio task (default).
+    ///
+    #[serde(default)]
+    pub block_reconstruction_cpu_core: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
